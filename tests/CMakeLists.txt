@@ -30,9 +30,9 @@ target_link_libraries(pdbsql_tests PRIVATE
 
 target_link_directories(pdbsql_tests PRIVATE ${DIA_LIB_DIR})
 
-# Define path to test PDB
+# Define path to test PDB (use CMAKE_CURRENT_SOURCE_DIR for monorepo compatibility)
 target_compile_definitions(pdbsql_tests PRIVATE
-    TEST_PDB_PATH="${CMAKE_SOURCE_DIR}/tests/testdata/test_program.pdb"
+    TEST_PDB_PATH="${CMAKE_CURRENT_SOURCE_DIR}/testdata/test_program.pdb"
 )
 
 include(GoogleTest)
