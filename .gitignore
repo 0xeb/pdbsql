@@ -1,0 +1,24 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.o
+
+# Test artifacts
+tests/testdata/*.pdb
+tests/testdata/*.exe
