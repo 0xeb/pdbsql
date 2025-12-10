@@ -3,7 +3,7 @@
 add_executable(pdbsql main.cpp)
 
 target_link_libraries(pdbsql PRIVATE
-    sqlite3
+    xsql::xsql
     diaguids
 )
 

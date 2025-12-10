@@ -2,7 +2,7 @@
 /**
  * pdb_tables.hpp - PDB entity virtual tables
  *
- * Defines virtual tables for PDB symbols using the vtable framework.
+ * Defines virtual tables for PDB symbols using the xsql vtable framework.
  * Tables use cached symbol data for efficient repeated queries.
  *
  * Tables:
@@ -25,13 +25,22 @@
  *   parameters    - Function parameters (per function)
  */
 
-#include "pdb_vtable.hpp"
+#include <xsql/xsql.hpp>
 #include "pdb_session.hpp"
 #include <vector>
 #include <memory>
 #include <unordered_map>
 
 namespace pdbsql {
+
+// Import xsql types into pdbsql namespace for convenience
+using xsql::VTableDef;
+using xsql::VTableBuilder;
+using xsql::ColumnDef;
+using xsql::ColumnType;
+using xsql::table;
+using xsql::register_vtable;
+using xsql::create_vtable;
 
 // ============================================================================
 // Symbol Cache Structures

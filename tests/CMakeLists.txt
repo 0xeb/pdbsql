@@ -18,13 +18,13 @@ add_executable(pdbsql_tests
 )
 
 target_include_directories(pdbsql_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/include
     ${DIA_INCLUDE_DIR}
 )
 
 target_link_libraries(pdbsql_tests PRIVATE
     GTest::gtest_main
-    sqlite3
+    xsql::xsql
     diaguids
 )
 

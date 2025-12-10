@@ -9,10 +9,12 @@ if(NOT WIN32)
     message(FATAL_ERROR "pdbsql requires Windows (MSDIA COM)")
 endif()
 
-# Output directories
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+# Output directories (only set if building standalone)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+endif()
 
 # Find DIA SDK
 set(DIA_SDK_PATHS
@@ -40,11 +42,25 @@ message(STATUS "Found DIA SDK: ${DIA_SDK_DIR}")
 set(DIA_INCLUDE_DIR "${DIA_SDK_DIR}/include")
 set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib/amd64")
 
-# SQLite
-add_subdirectory(src/3rd_party/sqlite)
+# ============================================================================
+# libxsql dependency
+# ============================================================================
+
+if(TARGET xsql::xsql)
+    # Part of monorepo - already available
+    message(STATUS "pdbsql: Using xsql::xsql from parent project")
+else()
+    # Standalone build - add libxsql as subdirectory
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libxsql/CMakeLists.txt")
+        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
+        message(STATUS "pdbsql: Added libxsql from sibling directory")
+    else()
+        message(FATAL_ERROR "libxsql not found. Build as part of xsql monorepo or ensure ../libxsql exists.")
+    endif()
+endif()
 
 # Main includes
-include_directories(${CMAKE_SOURCE_DIR}/src/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src/include)
 include_directories(${DIA_INCLUDE_DIR})
 link_directories(${DIA_LIB_DIR})
 
