@@ -3,7 +3,8 @@
  * pdb_tables.hpp - PDB entity virtual tables
  *
  * Defines virtual tables for PDB symbols using the xsql vtable framework.
- * Tables use cached symbol data for efficient repeated queries.
+ * Tables are streaming (generator_table) so full scans are lazy (LIMIT stops early),
+ * and common equality predicates are pushed down (xBestIndex) for speed.
  *
  * Tables:
  *   functions     - Function symbols (name, rva, length, etc.)
