@@ -27,6 +27,7 @@
 
 #include <xsql/xsql.hpp>
 #include "pdb_session.hpp"
+#include <algorithm>
 #include <vector>
 #include <memory>
 #include <unordered_map>
@@ -34,13 +35,10 @@
 namespace pdbsql {
 
 // Import xsql types into pdbsql namespace for convenience
-using xsql::VTableDef;
-using xsql::VTableBuilder;
-using xsql::ColumnDef;
-using xsql::ColumnType;
-using xsql::table;
-using xsql::register_vtable;
 using xsql::create_vtable;
+using xsql::GeneratorTableDef;
+using xsql::generator_table;
+using xsql::register_generator_vtable;
 
 // ============================================================================
 // Symbol Cache Structures
@@ -135,1047 +133,1886 @@ struct CachedLocal {
 };
 
 // ============================================================================
-// Global Caches
+// Streaming Generators (lazy full scans; LIMIT-friendly)
 // ============================================================================
 
-// Symbol caches by SymTag
-inline std::vector<CachedSymbol>& get_symbol_cache(enum SymTagEnum tag) {
-    static std::vector<CachedSymbol> function_cache;
-    static std::vector<CachedSymbol> public_cache;
-    static std::vector<CachedSymbol> data_cache;
-    static std::vector<CachedSymbol> udt_cache;
-    static std::vector<CachedSymbol> enum_cache;
-    static std::vector<CachedSymbol> typedef_cache;
-    static std::vector<CachedSymbol> thunk_cache;
-    static std::vector<CachedSymbol> label_cache;
-    static std::vector<CachedSymbol> all_cache;
+inline size_t to_size_t_clamped(LONG v) {
+    if (v <= 0) return 0;
+    return static_cast<size_t>(v);
+}
 
-    switch (tag) {
-        case SymTagFunction: return function_cache;
-        case SymTagPublicSymbol: return public_cache;
-        case SymTagData: return data_cache;
-        case SymTagUDT: return udt_cache;
-        case SymTagEnum: return enum_cache;
-        case SymTagTypedef: return typedef_cache;
-        case SymTagThunk: return thunk_cache;
-        case SymTagLabel: return label_cache;
-        default: return all_cache;
+inline std::string safe_symbol_name(IDiaSymbol* symbol) {
+    if (!symbol) return "";
+    SafeBSTR name;
+    if (SUCCEEDED(symbol->get_name(name.ptr()))) {
+        return name.str();
     }
+    return "";
 }
 
-inline std::vector<CachedCompiland>& get_compiland_cache() {
-    static std::vector<CachedCompiland> cache;
-    return cache;
-}
+inline CachedSymbol extract_symbol(IDiaSymbol* symbol) {
+    CachedSymbol cs;
+    if (!symbol) return cs;
 
-inline std::vector<CachedSourceFile>& get_source_file_cache() {
-    static std::vector<CachedSourceFile> cache;
-    return cache;
-}
+    symbol->get_symIndexId(&cs.id);
 
-inline std::vector<CachedLineNumber>& get_line_number_cache() {
-    static std::vector<CachedLineNumber> cache;
-    return cache;
-}
-
-inline std::vector<CachedSection>& get_section_cache() {
-    static std::vector<CachedSection> cache;
-    return cache;
-}
-
-inline std::vector<CachedMember>& get_member_cache() {
-    static std::vector<CachedMember> cache;
-    return cache;
-}
-
-inline std::vector<CachedEnumValue>& get_enum_value_cache() {
-    static std::vector<CachedEnumValue> cache;
-    return cache;
-}
-
-inline std::vector<CachedBaseClass>& get_base_class_cache() {
-    static std::vector<CachedBaseClass> cache;
-    return cache;
-}
-
-inline std::vector<CachedLocal>& get_local_cache() {
-    static std::vector<CachedLocal> cache;
-    return cache;
-}
-
-inline std::vector<CachedLocal>& get_parameter_cache() {
-    static std::vector<CachedLocal> cache;
-    return cache;
-}
-
-// ============================================================================
-// Cache Rebuild Functions
-// ============================================================================
-
-inline void rebuild_symbol_cache(PdbSession& session, enum SymTagEnum tag) {
-    auto& cache = get_symbol_cache(tag);
-    cache.clear();
-
-    auto symbols = session.enum_symbols(tag);
-    if (!symbols) return;
-
-    CComPtr<IDiaSymbol> symbol;
-    ULONG fetched = 0;
-
-    while (SUCCEEDED(symbols->Next(1, &symbol, &fetched)) && fetched == 1) {
-        CachedSymbol cs;
-        symbol->get_symIndexId(&cs.id);
-
-        SafeBSTR name;
-        if (SUCCEEDED(symbol->get_name(name.ptr()))) {
-            cs.name = name.str();
-        }
-
-        SafeBSTR undec;
-        if (SUCCEEDED(symbol->get_undecoratedName(undec.ptr()))) {
-            cs.undecorated = undec.str();
-        }
-
-        symbol->get_relativeVirtualAddress(&cs.rva);
-        symbol->get_length(&cs.length);
-        symbol->get_symTag(&cs.symtag);
-
-        DWORD section = 0, offset = 0;
-        symbol->get_addressSection(&section);
-        symbol->get_addressOffset(&offset);
-        cs.section = section;
-        cs.offset = offset;
-
-        cache.push_back(std::move(cs));
-        symbol.Release();
+    SafeBSTR name;
+    if (SUCCEEDED(symbol->get_name(name.ptr()))) {
+        cs.name = name.str();
     }
-}
 
-inline void rebuild_compiland_cache(PdbSession& session) {
-    auto& cache = get_compiland_cache();
-    cache.clear();
-
-    auto symbols = session.enum_symbols(SymTagCompiland);
-    if (!symbols) return;
-
-    CComPtr<IDiaSymbol> symbol;
-    ULONG fetched = 0;
-
-    while (SUCCEEDED(symbols->Next(1, &symbol, &fetched)) && fetched == 1) {
-        CachedCompiland cc;
-        symbol->get_symIndexId(&cc.id);
-
-        SafeBSTR name;
-        if (SUCCEEDED(symbol->get_name(name.ptr()))) {
-            cc.name = name.str();
-        }
-
-        SafeBSTR lib;
-        if (SUCCEEDED(symbol->get_libraryName(lib.ptr()))) {
-            cc.library_name = lib.str();
-        }
-
-        DWORD lang = 0;
-        symbol->get_language(&lang);
-        cc.language = lang;
-
-        cache.push_back(std::move(cc));
-        symbol.Release();
+    SafeBSTR undec;
+    if (SUCCEEDED(symbol->get_undecoratedName(undec.ptr()))) {
+        cs.undecorated = undec.str();
     }
+
+    symbol->get_relativeVirtualAddress(&cs.rva);
+    symbol->get_length(&cs.length);
+    symbol->get_symTag(&cs.symtag);
+
+    DWORD section = 0, offset = 0;
+    symbol->get_addressSection(&section);
+    symbol->get_addressOffset(&offset);
+    cs.section = section;
+    cs.offset = offset;
+
+    return cs;
 }
 
-inline void rebuild_source_file_cache(PdbSession& session) {
-    auto& cache = get_source_file_cache();
-    cache.clear();
+inline CachedCompiland extract_compiland(IDiaSymbol* symbol) {
+    CachedCompiland cc;
+    if (!symbol) return cc;
 
-    auto dia_session = session.session();
-    if (!dia_session) return;
+    symbol->get_symIndexId(&cc.id);
 
-    CComPtr<IDiaEnumSourceFiles> source_files;
-    if (FAILED(dia_session->findFile(nullptr, nullptr, nsNone, &source_files))) return;
-    if (!source_files) return;
+    SafeBSTR name;
+    if (SUCCEEDED(symbol->get_name(name.ptr()))) {
+        cc.name = name.str();
+    }
 
-    CComPtr<IDiaSourceFile> file;
-    ULONG fetched = 0;
+    SafeBSTR lib;
+    if (SUCCEEDED(symbol->get_libraryName(lib.ptr()))) {
+        cc.library_name = lib.str();
+    }
 
-    while (SUCCEEDED(source_files->Next(1, &file, &fetched)) && fetched == 1) {
-        CachedSourceFile sf;
-        file->get_uniqueId(&sf.id);
+    DWORD lang = 0;
+    symbol->get_language(&lang);
+    cc.language = lang;
 
-        SafeBSTR filename;
-        if (SUCCEEDED(file->get_fileName(filename.ptr()))) {
-            sf.filename = filename.str();
+    return cc;
+}
+
+inline CachedSourceFile extract_source_file(IDiaSourceFile* file) {
+    CachedSourceFile sf;
+    if (!file) return sf;
+
+    file->get_uniqueId(&sf.id);
+
+    SafeBSTR filename;
+    if (SUCCEEDED(file->get_fileName(filename.ptr()))) {
+        sf.filename = filename.str();
+    }
+
+    file->get_checksumType(&sf.checksum_type);
+    return sf;
+}
+
+class SymbolGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    enum SymTagEnum tag_;
+    CComPtr<IDiaEnumSymbols> symbols_;
+    CachedSymbol current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
+
+public:
+    SymbolGenerator(PdbSession& session, enum SymTagEnum tag) : session_(session), tag_(tag) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            symbols_ = session_.enum_symbols(tag_);
+        }
+        if (!symbols_) return false;
+
+        CComPtr<IDiaSymbol> symbol;
+        ULONG fetched = 0;
+        if (FAILED(symbols_->Next(1, &symbol, &fetched)) || fetched != 1) {
+            return false;
         }
 
-        file->get_checksumType(&sf.checksum_type);
-
-        cache.push_back(std::move(sf));
-        file.Release();
+        current_ = extract_symbol(symbol);
+        ++rowid_;
+        return true;
     }
-}
 
-inline void rebuild_line_number_cache(PdbSession& session) {
-    auto& cache = get_line_number_cache();
-    cache.clear();
+    const CachedSymbol& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
 
-    auto dia_session = session.session();
-    if (!dia_session) return;
+class CompilandGenerator : public xsql::Generator<CachedCompiland> {
+    PdbSession& session_;
+    CComPtr<IDiaEnumSymbols> compilands_;
+    CachedCompiland current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
 
-    // Enumerate all line numbers by iterating compilands
-    auto compilands = session.enum_symbols(SymTagCompiland);
-    if (!compilands) return;
+public:
+    explicit CompilandGenerator(PdbSession& session) : session_(session) {}
 
-    CComPtr<IDiaSymbol> compiland;
-    ULONG cfetched = 0;
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            compilands_ = session_.enum_symbols(SymTagCompiland);
+        }
+        if (!compilands_) return false;
 
-    while (SUCCEEDED(compilands->Next(1, &compiland, &cfetched)) && cfetched == 1) {
-        DWORD compiland_id = 0;
-        compiland->get_symIndexId(&compiland_id);
+        CComPtr<IDiaSymbol> symbol;
+        ULONG fetched = 0;
+        if (FAILED(compilands_->Next(1, &symbol, &fetched)) || fetched != 1) {
+            return false;
+        }
 
-        // Get source files for this compiland
-        CComPtr<IDiaEnumSourceFiles> source_files;
-        if (SUCCEEDED(dia_session->findFile(compiland, nullptr, nsNone, &source_files)) && source_files) {
-            CComPtr<IDiaSourceFile> file;
-            ULONG ffetched = 0;
+        current_ = extract_compiland(symbol);
+        ++rowid_;
+        return true;
+    }
 
-            while (SUCCEEDED(source_files->Next(1, &file, &ffetched)) && ffetched == 1) {
-                CComPtr<IDiaEnumLineNumbers> lines;
-                if (SUCCEEDED(dia_session->findLines(compiland, file, &lines)) && lines) {
-                    CComPtr<IDiaLineNumber> line;
-                    ULONG lfetched = 0;
+    const CachedCompiland& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
 
-                    while (SUCCEEDED(lines->Next(1, &line, &lfetched)) && lfetched == 1) {
-                        CachedLineNumber ln;
-                        line->get_sourceFileId(&ln.file_id);
-                        line->get_lineNumber(&ln.line);
-                        line->get_columnNumber(&ln.column);
-                        line->get_relativeVirtualAddress(&ln.rva);
-                        line->get_length(&ln.length);
-                        ln.compiland_id = compiland_id;
+class SourceFileGenerator : public xsql::Generator<CachedSourceFile> {
+    PdbSession& session_;
+    CComPtr<IDiaEnumSourceFiles> source_files_;
+    CachedSourceFile current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
 
-                        cache.push_back(std::move(ln));
-                        line.Release();
+public:
+    explicit SourceFileGenerator(PdbSession& session) : session_(session) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            IDiaSession* dia_session = session_.session();
+            if (!dia_session) return false;
+            if (FAILED(dia_session->findFile(nullptr, nullptr, nsNone, &source_files_))) return false;
+        }
+        if (!source_files_) return false;
+
+        CComPtr<IDiaSourceFile> file;
+        ULONG fetched = 0;
+        if (FAILED(source_files_->Next(1, &file, &fetched)) || fetched != 1) {
+            return false;
+        }
+
+        current_ = extract_source_file(file);
+        ++rowid_;
+        return true;
+    }
+
+    const CachedSourceFile& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class LineNumberGenerator : public xsql::Generator<CachedLineNumber> {
+    PdbSession& session_;
+    CComPtr<IDiaSession> dia_session_;
+
+    CComPtr<IDiaEnumSymbols> compilands_;
+    CComPtr<IDiaSymbol> current_compiland_;
+    DWORD current_compiland_id_ = 0;
+
+    CComPtr<IDiaEnumSourceFiles> source_files_;
+    CComPtr<IDiaEnumLineNumbers> lines_;
+
+    CachedLineNumber current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
+
+    bool advance_compiland() {
+        if (!compilands_) return false;
+
+        current_compiland_.Release();
+        current_compiland_id_ = 0;
+        source_files_.Release();
+        lines_.Release();
+
+        CComPtr<IDiaSymbol> compiland;
+        ULONG fetched = 0;
+        while (SUCCEEDED(compilands_->Next(1, &compiland, &fetched)) && fetched == 1) {
+            current_compiland_ = compiland;
+            current_compiland_->get_symIndexId(&current_compiland_id_);
+
+            if (SUCCEEDED(dia_session_->findFile(current_compiland_, nullptr, nsNone, &source_files_)) && source_files_) {
+                return true;
+            }
+
+            compiland.Release();
+            current_compiland_.Release();
+            current_compiland_id_ = 0;
+        }
+
+        return false;
+    }
+
+    bool advance_file() {
+        if (!source_files_) return false;
+
+        lines_.Release();
+
+        CComPtr<IDiaSourceFile> file;
+        ULONG fetched = 0;
+        while (SUCCEEDED(source_files_->Next(1, &file, &fetched)) && fetched == 1) {
+            if (SUCCEEDED(dia_session_->findLines(current_compiland_, file, &lines_)) && lines_) {
+                return true;
+            }
+            file.Release();
+        }
+
+        source_files_.Release();
+        return false;
+    }
+
+public:
+    explicit LineNumberGenerator(PdbSession& session) : session_(session) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            dia_session_ = session_.session();
+            if (!dia_session_) return false;
+            compilands_ = session_.enum_symbols(SymTagCompiland);
+            if (!compilands_) return false;
+            if (!advance_compiland()) return false;
+        }
+
+        while (true) {
+            if (!lines_) {
+                if (!advance_file()) {
+                    if (!advance_compiland()) {
+                        return false;
                     }
+                    continue;
                 }
-                file.Release();
             }
-        }
-        compiland.Release();
-    }
-}
 
-inline void rebuild_section_cache(PdbSession& session) {
-    auto& cache = get_section_cache();
-    cache.clear();
-
-    auto dia_session = session.session();
-    if (!dia_session) return;
-
-    CComPtr<IDiaEnumSectionContribs> contribs;
-    CComPtr<IDiaEnumTables> tables;
-    if (FAILED(dia_session->getEnumTables(&tables)) || !tables) return;
-
-    // Find section contributions table
-    CComPtr<IDiaTable> table;
-    ULONG tfetched = 0;
-    while (SUCCEEDED(tables->Next(1, &table, &tfetched)) && tfetched == 1) {
-        SafeBSTR name;
-        if (SUCCEEDED(table->get_name(name.ptr()))) {
-            if (wcscmp(name.get(), L"SectionContribs") == 0) {
-                table->QueryInterface(IID_IDiaEnumSectionContribs, (void**)&contribs);
-                break;
+            CComPtr<IDiaLineNumber> line;
+            ULONG fetched = 0;
+            if (FAILED(lines_->Next(1, &line, &fetched)) || fetched != 1) {
+                lines_.Release();
+                continue;
             }
+
+            current_ = {};
+            line->get_sourceFileId(&current_.file_id);
+            line->get_lineNumber(&current_.line);
+            line->get_columnNumber(&current_.column);
+            line->get_relativeVirtualAddress(&current_.rva);
+            line->get_length(&current_.length);
+            current_.compiland_id = current_compiland_id_;
+            ++rowid_;
+            return true;
         }
-        table.Release();
     }
 
-    if (!contribs) return;
+    const CachedLineNumber& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
 
-    // Collect unique sections
-    std::unordered_map<DWORD, CachedSection> sections;
+class SectionGenerator : public xsql::Generator<CachedSection> {
+    PdbSession& session_;
+    std::vector<CachedSection> sections_;
+    size_t idx_ = 0;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
 
-    CComPtr<IDiaSectionContrib> contrib;
-    ULONG cfetched = 0;
-    while (SUCCEEDED(contribs->Next(1, &contrib, &cfetched)) && cfetched == 1) {
-        DWORD sec_num = 0;
-        contrib->get_addressSection(&sec_num);
+    void build() {
+        sections_.clear();
 
-        if (sections.find(sec_num) == sections.end()) {
-            CachedSection cs;
-            cs.section_number = sec_num;
+        IDiaSession* dia_session = session_.session();
+        if (!dia_session) return;
+
+        CComPtr<IDiaEnumTables> tables;
+        if (FAILED(dia_session->getEnumTables(&tables)) || !tables) return;
+
+        // Find section contributions table
+        CComPtr<IDiaEnumSectionContribs> contribs;
+        CComPtr<IDiaTable> table;
+        ULONG tfetched = 0;
+        while (SUCCEEDED(tables->Next(1, &table, &tfetched)) && tfetched == 1) {
+            SafeBSTR name;
+            if (SUCCEEDED(table->get_name(name.ptr()))) {
+                if (wcscmp(name.get(), L"SectionContribs") == 0) {
+                    table->QueryInterface(IID_IDiaEnumSectionContribs, (void**)&contribs);
+                    break;
+                }
+            }
+            table.Release();
+        }
+        if (!contribs) return;
+
+        std::unordered_map<DWORD, CachedSection> sections;
+
+        CComPtr<IDiaSectionContrib> contrib;
+        ULONG cfetched = 0;
+        while (SUCCEEDED(contribs->Next(1, &contrib, &cfetched)) && cfetched == 1) {
+            DWORD sec_num = 0;
+            contrib->get_addressSection(&sec_num);
 
             DWORD rva = 0, len = 0;
             contrib->get_relativeVirtualAddress(&rva);
             contrib->get_length(&len);
 
-            cs.rva = rva;
-            cs.length = len;
+            auto [it, inserted] = sections.emplace(sec_num, CachedSection{});
+            CachedSection& cs = it->second;
 
-            // Get boolean properties directly from IDiaSectionContrib
-            BOOL val = FALSE;
-            if (SUCCEEDED(contrib->get_read(&val))) cs.read = (val != FALSE);
-            if (SUCCEEDED(contrib->get_write(&val))) cs.write = (val != FALSE);
-            if (SUCCEEDED(contrib->get_execute(&val))) cs.execute = (val != FALSE);
-            if (SUCCEEDED(contrib->get_code(&val))) cs.code = (val != FALSE);
+            if (inserted) {
+                cs.section_number = sec_num;
+                cs.rva = rva;
+                cs.length = len;
 
-            sections[sec_num] = cs;
-        } else {
-            // Extend section bounds
-            DWORD rva = 0, len = 0;
-            contrib->get_relativeVirtualAddress(&rva);
-            contrib->get_length(&len);
-
-            auto& s = sections[sec_num];
-            DWORD end = rva + len;
-            DWORD cur_end = s.rva + s.length;
-            if (end > cur_end) {
-                s.length = end - s.rva;
+                BOOL val = FALSE;
+                if (SUCCEEDED(contrib->get_read(&val))) cs.read = (val != FALSE);
+                if (SUCCEEDED(contrib->get_write(&val))) cs.write = (val != FALSE);
+                if (SUCCEEDED(contrib->get_execute(&val))) cs.execute = (val != FALSE);
+                if (SUCCEEDED(contrib->get_code(&val))) cs.code = (val != FALSE);
+            } else {
+                DWORD end = rva + len;
+                DWORD cur_end = cs.rva + cs.length;
+                if (end > cur_end) {
+                    cs.length = end - cs.rva;
+                }
             }
-        }
-        contrib.Release();
-    }
 
-    for (auto& [num, sec] : sections) {
-        cache.push_back(sec);
-    }
-}
-
-inline void rebuild_member_cache(PdbSession& session) {
-    auto& cache = get_member_cache();
-    cache.clear();
-
-    // Enumerate all UDTs and their members
-    auto udts = session.enum_symbols(SymTagUDT);
-    if (!udts) return;
-
-    CComPtr<IDiaSymbol> udt;
-    ULONG ufetched = 0;
-
-    while (SUCCEEDED(udts->Next(1, &udt, &ufetched)) && ufetched == 1) {
-        DWORD parent_id = 0;
-        std::string parent_name;
-
-        udt->get_symIndexId(&parent_id);
-        SafeBSTR pname;
-        if (SUCCEEDED(udt->get_name(pname.ptr()))) {
-            parent_name = pname.str();
+            contrib.Release();
         }
 
-        // Get members (SymTagData children of UDT)
-        CComPtr<IDiaEnumSymbols> members;
-        if (SUCCEEDED(udt->findChildren(SymTagData, nullptr, nsNone, &members)) && members) {
+        sections_.reserve(sections.size());
+        for (const auto& [num, sec] : sections) {
+            sections_.push_back(sec);
+        }
+
+        std::sort(sections_.begin(), sections_.end(), [](const CachedSection& a, const CachedSection& b) {
+            return a.section_number < b.section_number;
+        });
+    }
+
+public:
+    explicit SectionGenerator(PdbSession& session) : session_(session) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            build();
+        }
+
+        if (idx_ >= sections_.size()) return false;
+        ++rowid_;
+        ++idx_;
+        return true;
+    }
+
+    const CachedSection& current() const override { return sections_[idx_ - 1]; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class MemberGenerator : public xsql::Generator<CachedMember> {
+    PdbSession& session_;
+    CComPtr<IDiaEnumSymbols> udts_;
+    CComPtr<IDiaSymbol> current_udt_;
+    DWORD current_udt_id_ = 0;
+    std::string current_udt_name_;
+    CComPtr<IDiaEnumSymbols> members_;
+
+    CachedMember current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
+
+    bool advance_udt() {
+        current_udt_.Release();
+        current_udt_id_ = 0;
+        current_udt_name_.clear();
+        members_.Release();
+
+        CComPtr<IDiaSymbol> udt;
+        ULONG fetched = 0;
+        while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            current_udt_ = udt;
+            current_udt_->get_symIndexId(&current_udt_id_);
+            current_udt_name_ = safe_symbol_name(current_udt_);
+
+            if (SUCCEEDED(current_udt_->findChildren(SymTagData, nullptr, nsNone, &members_)) && members_) {
+                return true;
+            }
+
+            udt.Release();
+            current_udt_.Release();
+            current_udt_id_ = 0;
+            current_udt_name_.clear();
+        }
+        return false;
+    }
+
+public:
+    explicit MemberGenerator(PdbSession& session) : session_(session) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            udts_ = session_.enum_symbols(SymTagUDT);
+            if (!udts_) return false;
+            if (!advance_udt()) return false;
+        }
+
+        while (true) {
+            if (!members_) {
+                if (!advance_udt()) return false;
+            }
+
             CComPtr<IDiaSymbol> member;
-            ULONG mfetched = 0;
-
-            while (SUCCEEDED(members->Next(1, &member, &mfetched)) && mfetched == 1) {
-                CachedMember cm;
-                cm.parent_id = parent_id;
-                cm.parent_name = parent_name;
-
-                member->get_symIndexId(&cm.id);
-
-                SafeBSTR mname;
-                if (SUCCEEDED(member->get_name(mname.ptr()))) {
-                    cm.name = mname.str();
-                }
-
-                // Get type
-                CComPtr<IDiaSymbol> type;
-                if (SUCCEEDED(member->get_type(&type)) && type) {
-                    SafeBSTR tname;
-                    if (SUCCEEDED(type->get_name(tname.ptr()))) {
-                        cm.type_name = tname.str();
-                    }
-                    ULONGLONG len = 0;
-                    type->get_length(&len);
-                    cm.length = len;
-                }
-
-                LONG offset = 0;
-                member->get_offset(&offset);
-                cm.offset = static_cast<DWORD>(offset);
-
-                DWORD access = 0;
-                member->get_access(&access);
-                cm.access = access;
-
-                DWORD loc_type = 0;
-                member->get_locationType(&loc_type);
-                cm.is_static = (loc_type == LocIsStatic);
-
-                BOOL virt = FALSE;
-                member->get_virtual(&virt);
-                cm.is_virtual = (virt != FALSE);
-
-                cache.push_back(std::move(cm));
-                member.Release();
+            ULONG fetched = 0;
+            if (FAILED(members_->Next(1, &member, &fetched)) || fetched != 1) {
+                members_.Release();
+                continue;
             }
+
+            current_ = {};
+            current_.parent_id = current_udt_id_;
+            current_.parent_name = current_udt_name_;
+
+            member->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(member);
+
+            CComPtr<IDiaSymbol> type;
+            if (SUCCEEDED(member->get_type(&type)) && type) {
+                current_.type_name = safe_symbol_name(type);
+                ULONGLONG len = 0;
+                type->get_length(&len);
+                current_.length = len;
+            }
+
+            LONG offset = 0;
+            member->get_offset(&offset);
+            current_.offset = static_cast<DWORD>(offset);
+
+            DWORD access = 0;
+            member->get_access(&access);
+            current_.access = access;
+
+            DWORD loc_type = 0;
+            member->get_locationType(&loc_type);
+            current_.is_static = (loc_type == LocIsStatic);
+
+            BOOL virt = FALSE;
+            member->get_virtual(&virt);
+            current_.is_virtual = (virt != FALSE);
+
+            ++rowid_;
+            return true;
         }
-        udt.Release();
     }
-}
 
-inline void rebuild_enum_value_cache(PdbSession& session) {
-    auto& cache = get_enum_value_cache();
-    cache.clear();
+    const CachedMember& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
 
-    auto enums = session.enum_symbols(SymTagEnum);
-    if (!enums) return;
+class EnumValueGenerator : public xsql::Generator<CachedEnumValue> {
+    PdbSession& session_;
+    CComPtr<IDiaEnumSymbols> enums_;
+    CComPtr<IDiaSymbol> current_enum_;
+    DWORD current_enum_id_ = 0;
+    std::string current_enum_name_;
+    CComPtr<IDiaEnumSymbols> values_;
 
-    CComPtr<IDiaSymbol> enum_sym;
-    ULONG efetched = 0;
+    CachedEnumValue current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
 
-    while (SUCCEEDED(enums->Next(1, &enum_sym, &efetched)) && efetched == 1) {
-        DWORD enum_id = 0;
-        std::string enum_name;
+    bool advance_enum() {
+        current_enum_.Release();
+        current_enum_id_ = 0;
+        current_enum_name_.clear();
+        values_.Release();
 
-        enum_sym->get_symIndexId(&enum_id);
-        SafeBSTR ename;
-        if (SUCCEEDED(enum_sym->get_name(ename.ptr()))) {
-            enum_name = ename.str();
+        CComPtr<IDiaSymbol> en;
+        ULONG fetched = 0;
+        while (SUCCEEDED(enums_->Next(1, &en, &fetched)) && fetched == 1) {
+            current_enum_ = en;
+            current_enum_->get_symIndexId(&current_enum_id_);
+            current_enum_name_ = safe_symbol_name(current_enum_);
+
+            if (SUCCEEDED(current_enum_->findChildren(SymTagData, nullptr, nsNone, &values_)) && values_) {
+                return true;
+            }
+
+            en.Release();
+            current_enum_.Release();
+            current_enum_id_ = 0;
+            current_enum_name_.clear();
         }
 
-        // Get enum values (SymTagData children)
-        CComPtr<IDiaEnumSymbols> values;
-        if (SUCCEEDED(enum_sym->findChildren(SymTagData, nullptr, nsNone, &values)) && values) {
+        return false;
+    }
+
+    static int64_t variant_to_int64(const VARIANT& v) {
+        switch (v.vt) {
+            case VT_I1: return v.cVal;
+            case VT_I2: return v.iVal;
+            case VT_I4: return v.lVal;
+            case VT_I8: return v.llVal;
+            case VT_UI1: return v.bVal;
+            case VT_UI2: return v.uiVal;
+            case VT_UI4: return v.ulVal;
+            case VT_UI8: return static_cast<int64_t>(v.ullVal);
+            case VT_INT: return v.intVal;
+            case VT_UINT: return v.uintVal;
+            default: return 0;
+        }
+    }
+
+public:
+    explicit EnumValueGenerator(PdbSession& session) : session_(session) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            enums_ = session_.enum_symbols(SymTagEnum);
+            if (!enums_) return false;
+            if (!advance_enum()) return false;
+        }
+
+        while (true) {
+            if (!values_) {
+                if (!advance_enum()) return false;
+            }
+
             CComPtr<IDiaSymbol> val;
-            ULONG vfetched = 0;
-
-            while (SUCCEEDED(values->Next(1, &val, &vfetched)) && vfetched == 1) {
-                CachedEnumValue ev;
-                ev.enum_id = enum_id;
-                ev.enum_name = enum_name;
-
-                val->get_symIndexId(&ev.id);
-
-                SafeBSTR vname;
-                if (SUCCEEDED(val->get_name(vname.ptr()))) {
-                    ev.name = vname.str();
-                }
-
-                VARIANT v = {};
-                if (SUCCEEDED(val->get_value(&v))) {
-                    switch (v.vt) {
-                        case VT_I1: ev.value = v.cVal; break;
-                        case VT_I2: ev.value = v.iVal; break;
-                        case VT_I4: ev.value = v.lVal; break;
-                        case VT_I8: ev.value = v.llVal; break;
-                        case VT_UI1: ev.value = v.bVal; break;
-                        case VT_UI2: ev.value = v.uiVal; break;
-                        case VT_UI4: ev.value = v.ulVal; break;
-                        case VT_UI8: ev.value = static_cast<int64_t>(v.ullVal); break;
-                        case VT_INT: ev.value = v.intVal; break;
-                        case VT_UINT: ev.value = v.uintVal; break;
-                        default: break;
-                    }
-                    VariantClear(&v);
-                }
-
-                cache.push_back(std::move(ev));
-                val.Release();
+            ULONG fetched = 0;
+            if (FAILED(values_->Next(1, &val, &fetched)) || fetched != 1) {
+                values_.Release();
+                continue;
             }
+
+            current_ = {};
+            current_.enum_id = current_enum_id_;
+            current_.enum_name = current_enum_name_;
+
+            val->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(val);
+
+            VARIANT v = {};
+            if (SUCCEEDED(val->get_value(&v))) {
+                current_.value = variant_to_int64(v);
+                VariantClear(&v);
+            }
+
+            ++rowid_;
+            return true;
         }
-        enum_sym.Release();
     }
-}
 
-inline void rebuild_base_class_cache(PdbSession& session) {
-    auto& cache = get_base_class_cache();
-    cache.clear();
+    const CachedEnumValue& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
 
-    auto udts = session.enum_symbols(SymTagUDT);
-    if (!udts) return;
+class BaseClassGenerator : public xsql::Generator<CachedBaseClass> {
+    PdbSession& session_;
+    CComPtr<IDiaEnumSymbols> udts_;
+    CComPtr<IDiaSymbol> current_udt_;
+    DWORD current_udt_id_ = 0;
+    std::string current_udt_name_;
+    CComPtr<IDiaEnumSymbols> bases_;
 
-    CComPtr<IDiaSymbol> udt;
-    ULONG ufetched = 0;
+    CachedBaseClass current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
 
-    while (SUCCEEDED(udts->Next(1, &udt, &ufetched)) && ufetched == 1) {
-        DWORD derived_id = 0;
-        std::string derived_name;
+    bool advance_udt() {
+        current_udt_.Release();
+        current_udt_id_ = 0;
+        current_udt_name_.clear();
+        bases_.Release();
 
-        udt->get_symIndexId(&derived_id);
-        SafeBSTR dname;
-        if (SUCCEEDED(udt->get_name(dname.ptr()))) {
-            derived_name = dname.str();
+        CComPtr<IDiaSymbol> udt;
+        ULONG fetched = 0;
+        while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            current_udt_ = udt;
+            current_udt_->get_symIndexId(&current_udt_id_);
+            current_udt_name_ = safe_symbol_name(current_udt_);
+
+            if (SUCCEEDED(current_udt_->findChildren(SymTagBaseClass, nullptr, nsNone, &bases_)) && bases_) {
+                return true;
+            }
+
+            udt.Release();
+            current_udt_.Release();
+            current_udt_id_ = 0;
+            current_udt_name_.clear();
         }
 
-        // Get base classes
-        CComPtr<IDiaEnumSymbols> bases;
-        if (SUCCEEDED(udt->findChildren(SymTagBaseClass, nullptr, nsNone, &bases)) && bases) {
+        return false;
+    }
+
+public:
+    explicit BaseClassGenerator(PdbSession& session) : session_(session) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            udts_ = session_.enum_symbols(SymTagUDT);
+            if (!udts_) return false;
+            if (!advance_udt()) return false;
+        }
+
+        while (true) {
+            if (!bases_) {
+                if (!advance_udt()) return false;
+            }
+
             CComPtr<IDiaSymbol> base;
-            ULONG bfetched = 0;
-
-            while (SUCCEEDED(bases->Next(1, &base, &bfetched)) && bfetched == 1) {
-                CachedBaseClass bc;
-                bc.derived_id = derived_id;
-                bc.derived_name = derived_name;
-
-                // Get the base type
-                CComPtr<IDiaSymbol> base_type;
-                if (SUCCEEDED(base->get_type(&base_type)) && base_type) {
-                    base_type->get_symIndexId(&bc.base_id);
-                    SafeBSTR bname;
-                    if (SUCCEEDED(base_type->get_name(bname.ptr()))) {
-                        bc.base_name = bname.str();
-                    }
-                }
-
-                LONG offset = 0;
-                base->get_offset(&offset);
-                bc.offset = static_cast<DWORD>(offset);
-
-                BOOL virt = FALSE;
-                base->get_virtualBaseClass(&virt);
-                bc.is_virtual = (virt != FALSE);
-
-                DWORD access = 0;
-                base->get_access(&access);
-                bc.access = access;
-
-                cache.push_back(std::move(bc));
-                base.Release();
+            ULONG fetched = 0;
+            if (FAILED(bases_->Next(1, &base, &fetched)) || fetched != 1) {
+                bases_.Release();
+                continue;
             }
+
+            current_ = {};
+            current_.derived_id = current_udt_id_;
+            current_.derived_name = current_udt_name_;
+
+            CComPtr<IDiaSymbol> base_type;
+            if (SUCCEEDED(base->get_type(&base_type)) && base_type) {
+                base_type->get_symIndexId(&current_.base_id);
+                current_.base_name = safe_symbol_name(base_type);
+            }
+
+            LONG offset = 0;
+            base->get_offset(&offset);
+            current_.offset = static_cast<DWORD>(offset);
+
+            BOOL virt = FALSE;
+            base->get_virtualBaseClass(&virt);
+            current_.is_virtual = (virt != FALSE);
+
+            DWORD access = 0;
+            base->get_access(&access);
+            current_.access = access;
+
+            ++rowid_;
+            return true;
         }
-        udt.Release();
     }
-}
 
-inline void rebuild_local_and_param_caches(PdbSession& session) {
-    auto& local_cache = get_local_cache();
-    auto& param_cache = get_parameter_cache();
-    local_cache.clear();
-    param_cache.clear();
+    const CachedBaseClass& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
 
-    auto functions = session.enum_symbols(SymTagFunction);
-    if (!functions) return;
+class LocalOrParamGenerator : public xsql::Generator<CachedLocal> {
+    PdbSession& session_;
+    DWORD want_kind_ = 0;
 
-    CComPtr<IDiaSymbol> func;
-    ULONG ffetched = 0;
+    CComPtr<IDiaEnumSymbols> functions_;
+    CComPtr<IDiaSymbol> current_func_;
+    DWORD current_func_id_ = 0;
+    std::string current_func_name_;
+    CComPtr<IDiaEnumSymbols> data_syms_;
 
-    while (SUCCEEDED(functions->Next(1, &func, &ffetched)) && ffetched == 1) {
-        DWORD func_id = 0;
-        std::string func_name;
+    CachedLocal current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
 
-        func->get_symIndexId(&func_id);
-        SafeBSTR fname;
-        if (SUCCEEDED(func->get_name(fname.ptr()))) {
-            func_name = fname.str();
+    bool advance_func() {
+        current_func_.Release();
+        current_func_id_ = 0;
+        current_func_name_.clear();
+        data_syms_.Release();
+
+        CComPtr<IDiaSymbol> func;
+        ULONG fetched = 0;
+        while (SUCCEEDED(functions_->Next(1, &func, &fetched)) && fetched == 1) {
+            current_func_ = func;
+            current_func_->get_symIndexId(&current_func_id_);
+            current_func_name_ = safe_symbol_name(current_func_);
+
+            if (SUCCEEDED(current_func_->findChildren(SymTagData, nullptr, nsNone, &data_syms_)) && data_syms_) {
+                return true;
+            }
+
+            func.Release();
+            current_func_.Release();
+            current_func_id_ = 0;
+            current_func_name_.clear();
+        }
+        return false;
+    }
+
+public:
+    LocalOrParamGenerator(PdbSession& session, DWORD want_kind) : session_(session), want_kind_(want_kind) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            functions_ = session_.enum_symbols(SymTagFunction);
+            if (!functions_) return false;
+            if (!advance_func()) return false;
         }
 
-        // Get all data children (locals and parameters)
-        CComPtr<IDiaEnumSymbols> data_syms;
-        if (SUCCEEDED(func->findChildren(SymTagData, nullptr, nsNone, &data_syms)) && data_syms) {
+        while (true) {
+            if (!data_syms_) {
+                if (!advance_func()) return false;
+            }
+
             CComPtr<IDiaSymbol> data;
-            ULONG dfetched = 0;
-
-            while (SUCCEEDED(data_syms->Next(1, &data, &dfetched)) && dfetched == 1) {
-                CachedLocal cl;
-                cl.func_id = func_id;
-                cl.func_name = func_name;
-
-                data->get_symIndexId(&cl.id);
-
-                SafeBSTR dname;
-                if (SUCCEEDED(data->get_name(dname.ptr()))) {
-                    cl.name = dname.str();
-                }
-
-                // Get type name
-                CComPtr<IDiaSymbol> type;
-                if (SUCCEEDED(data->get_type(&type)) && type) {
-                    SafeBSTR tname;
-                    if (SUCCEEDED(type->get_name(tname.ptr()))) {
-                        cl.type_name = tname.str();
-                    }
-                }
-
-                DWORD loc_type = 0;
-                data->get_locationType(&loc_type);
-                cl.location_type = loc_type;
-
-                // Get offset or register based on location type
-                LONG offset = 0;
-                DWORD reg = 0;
-                data->get_offset(&offset);
-                data->get_registerId(&reg);
-                cl.offset_or_register = (loc_type == LocIsRegRel) ? offset : reg;
-
-                // Determine if it's a parameter
-                DWORD data_kind = 0;
-                data->get_dataKind(&data_kind);
-
-                if (data_kind == DataIsParam) {
-                    param_cache.push_back(cl);
-                } else if (data_kind == DataIsLocal) {
-                    local_cache.push_back(cl);
-                }
-
-                data.Release();
+            ULONG fetched = 0;
+            if (FAILED(data_syms_->Next(1, &data, &fetched)) || fetched != 1) {
+                data_syms_.Release();
+                continue;
             }
+
+            DWORD data_kind = 0;
+            data->get_dataKind(&data_kind);
+            if (data_kind != want_kind_) {
+                data.Release();
+                continue;
+            }
+
+            current_ = {};
+            current_.func_id = current_func_id_;
+            current_.func_name = current_func_name_;
+
+            data->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(data);
+
+            CComPtr<IDiaSymbol> type;
+            if (SUCCEEDED(data->get_type(&type)) && type) {
+                current_.type_name = safe_symbol_name(type);
+            }
+
+            DWORD loc_type = 0;
+            data->get_locationType(&loc_type);
+            current_.location_type = loc_type;
+
+            LONG offset = 0;
+            DWORD reg = 0;
+            data->get_offset(&offset);
+            data->get_registerId(&reg);
+            current_.offset_or_register = (loc_type == LocIsRegRel) ? offset : static_cast<int64_t>(reg);
+
+            ++rowid_;
+            return true;
         }
-        func.Release();
     }
+
+    const CachedLocal& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+template<typename RowData>
+class GeneratorRowIterator final : public xsql::RowIterator {
+    const GeneratorTableDef<RowData>* def_ = nullptr;
+    std::unique_ptr<xsql::Generator<RowData>> gen_;
+    bool eof_ = true;
+
+public:
+    GeneratorRowIterator(const GeneratorTableDef<RowData>* def,
+                         std::unique_ptr<xsql::Generator<RowData>> gen)
+        : def_(def)
+        , gen_(std::move(gen))
+    {}
+
+    bool next() override {
+        if (!gen_ || !gen_->next()) {
+            eof_ = true;
+            return false;
+        }
+        eof_ = false;
+        return true;
+    }
+
+    bool eof() const override { return eof_; }
+
+    void column(sqlite3_context* ctx, int col) override {
+        if (!ctx || eof_ || !def_) {
+            sqlite3_result_null(ctx);
+            return;
+        }
+
+        if (col < 0 || static_cast<size_t>(col) >= def_->columns.size()) {
+            sqlite3_result_null(ctx);
+            return;
+        }
+
+        def_->columns[col].get(ctx, gen_->current());
+    }
+
+    int64_t rowid() const override {
+        if (eof_ || !gen_) return 0;
+        return static_cast<int64_t>(gen_->rowid());
+    }
+};
+
+template<typename RowData>
+inline void add_filter_eq(GeneratorTableDef<RowData>& def,
+                          const char* column_name,
+                          std::function<std::unique_ptr<xsql::RowIterator>(int64_t)> factory,
+                          double cost = 10.0,
+                          double est_rows = 10.0) {
+    int col_idx = def.find_column(column_name ? column_name : "");
+    if (col_idx < 0) return;
+    int filter_id = static_cast<int>(def.filters.size()) + 1;
+    def.filters.emplace_back(
+        col_idx, filter_id, cost, est_rows,
+        [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<xsql::RowIterator> {
+            return factory(sqlite3_value_int64(val));
+        });
 }
+
+template<typename RowData>
+inline void add_filter_eq_text(GeneratorTableDef<RowData>& def,
+                               const char* column_name,
+                               std::function<std::unique_ptr<xsql::RowIterator>(const char*)> factory,
+                               double cost = 10.0,
+                               double est_rows = 10.0) {
+    int col_idx = def.find_column(column_name ? column_name : "");
+    if (col_idx < 0) return;
+    int filter_id = static_cast<int>(def.filters.size()) + 1;
+    def.filters.emplace_back(
+        col_idx, filter_id, cost, est_rows,
+        [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<xsql::RowIterator> {
+            const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+            return factory(text ? text : "");
+        });
+}
+
+// Filtered generators used by constraint pushdown (xBestIndex/xFilter).
+
+class SymbolByNameGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    enum SymTagEnum tag_;
+    std::string name_;
+    CComPtr<IDiaEnumSymbols> symbols_;
+    CachedSymbol current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
+
+public:
+    SymbolByNameGenerator(PdbSession& session, enum SymTagEnum tag, std::string name)
+        : session_(session)
+        , tag_(tag)
+        , name_(std::move(name))
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            symbols_ = session_.find_symbols(name_, tag_);
+        }
+        if (!symbols_) return false;
+
+        CComPtr<IDiaSymbol> symbol;
+        ULONG fetched = 0;
+        if (FAILED(symbols_->Next(1, &symbol, &fetched)) || fetched != 1) {
+            return false;
+        }
+
+        current_ = extract_symbol(symbol);
+        ++rowid_;
+        return true;
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class SymbolByIdGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    DWORD id_ = 0;
+    enum SymTagEnum tag_;
+    std::function<bool(IDiaSymbol*)> accept_;
+    CachedSymbol current_;
+    bool emitted_ = false;
+    sqlite3_int64 rowid_ = -1;
+
+public:
+    SymbolByIdGenerator(PdbSession& session,
+                        DWORD id,
+                        enum SymTagEnum tag,
+                        std::function<bool(IDiaSymbol*)> accept = nullptr)
+        : session_(session)
+        , id_(id)
+        , tag_(tag)
+        , accept_(std::move(accept))
+    {}
+
+    bool next() override {
+        if (emitted_) return false;
+        emitted_ = true;
+
+        IDiaSession* dia_session = session_.session();
+        if (!dia_session) return false;
+
+        CComPtr<IDiaSymbol> symbol;
+        if (FAILED(dia_session->symbolById(id_, &symbol)) || !symbol) {
+            return false;
+        }
+
+        DWORD got_tag = 0;
+        symbol->get_symTag(&got_tag);
+        if (static_cast<enum SymTagEnum>(got_tag) != tag_) {
+            return false;
+        }
+
+        if (accept_ && !accept_(symbol)) {
+            return false;
+        }
+
+        current_ = extract_symbol(symbol);
+        rowid_ = 0;
+        return true;
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class CompilandByNameGenerator : public xsql::Generator<CachedCompiland> {
+    PdbSession& session_;
+    std::string name_;
+    CComPtr<IDiaEnumSymbols> compilands_;
+    CachedCompiland current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
+
+public:
+    CompilandByNameGenerator(PdbSession& session, std::string name)
+        : session_(session)
+        , name_(std::move(name))
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            compilands_ = session_.find_symbols(name_, SymTagCompiland);
+        }
+        if (!compilands_) return false;
+
+        CComPtr<IDiaSymbol> symbol;
+        ULONG fetched = 0;
+        if (FAILED(compilands_->Next(1, &symbol, &fetched)) || fetched != 1) {
+            return false;
+        }
+
+        current_ = extract_compiland(symbol);
+        ++rowid_;
+        return true;
+    }
+
+    const CachedCompiland& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class CompilandByIdGenerator : public xsql::Generator<CachedCompiland> {
+    PdbSession& session_;
+    DWORD id_ = 0;
+    CachedCompiland current_;
+    bool emitted_ = false;
+    sqlite3_int64 rowid_ = -1;
+
+public:
+    CompilandByIdGenerator(PdbSession& session, DWORD id)
+        : session_(session)
+        , id_(id)
+    {}
+
+    bool next() override {
+        if (emitted_) return false;
+        emitted_ = true;
+
+        IDiaSession* dia_session = session_.session();
+        if (!dia_session) return false;
+
+        CComPtr<IDiaSymbol> symbol;
+        if (FAILED(dia_session->symbolById(id_, &symbol)) || !symbol) {
+            return false;
+        }
+
+        DWORD tag = 0;
+        symbol->get_symTag(&tag);
+        if (static_cast<enum SymTagEnum>(tag) != SymTagCompiland) {
+            return false;
+        }
+
+        current_ = extract_compiland(symbol);
+        rowid_ = 0;
+        return true;
+    }
+
+    const CachedCompiland& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class SourceFileByIdGenerator : public xsql::Generator<CachedSourceFile> {
+    PdbSession& session_;
+    DWORD file_id_ = 0;
+    CachedSourceFile current_;
+    bool emitted_ = false;
+    sqlite3_int64 rowid_ = -1;
+
+public:
+    SourceFileByIdGenerator(PdbSession& session, DWORD file_id)
+        : session_(session)
+        , file_id_(file_id)
+    {}
+
+    bool next() override {
+        if (emitted_) return false;
+        emitted_ = true;
+
+        IDiaSession* dia_session = session_.session();
+        if (!dia_session) return false;
+
+        CComPtr<IDiaSourceFile> file;
+        if (FAILED(dia_session->findFileById(file_id_, &file)) || !file) {
+            return false;
+        }
+
+        current_ = extract_source_file(file);
+        rowid_ = 0;
+        return true;
+    }
+
+    const CachedSourceFile& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class UdtMembersByIdGenerator : public xsql::Generator<CachedMember> {
+    PdbSession& session_;
+    DWORD udt_id_ = 0;
+    bool started_ = false;
+    DWORD parent_id_ = 0;
+    std::string parent_name_;
+    CComPtr<IDiaEnumSymbols> members_;
+    CachedMember current_;
+    sqlite3_int64 rowid_ = -1;
+
+public:
+    UdtMembersByIdGenerator(PdbSession& session, DWORD udt_id)
+        : session_(session)
+        , udt_id_(udt_id)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+
+            IDiaSession* dia_session = session_.session();
+            if (!dia_session) return false;
+
+            CComPtr<IDiaSymbol> udt;
+            if (FAILED(dia_session->symbolById(udt_id_, &udt)) || !udt) return false;
+
+            DWORD tag = 0;
+            udt->get_symTag(&tag);
+            if (static_cast<enum SymTagEnum>(tag) != SymTagUDT) return false;
+
+            parent_id_ = udt_id_;
+            parent_name_ = safe_symbol_name(udt);
+            if (FAILED(udt->findChildren(SymTagData, nullptr, nsNone, &members_)) || !members_) return false;
+        }
+
+        while (true) {
+            CComPtr<IDiaSymbol> member;
+            ULONG fetched = 0;
+            if (FAILED(members_->Next(1, &member, &fetched)) || fetched != 1) {
+                return false;
+            }
+
+            current_ = {};
+            current_.parent_id = parent_id_;
+            current_.parent_name = parent_name_;
+
+            member->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(member);
+
+            CComPtr<IDiaSymbol> type;
+            if (SUCCEEDED(member->get_type(&type)) && type) {
+                current_.type_name = safe_symbol_name(type);
+                ULONGLONG len = 0;
+                type->get_length(&len);
+                current_.length = len;
+            }
+
+            LONG offset = 0;
+            member->get_offset(&offset);
+            current_.offset = static_cast<DWORD>(offset);
+
+            DWORD access = 0;
+            member->get_access(&access);
+            current_.access = access;
+
+            DWORD loc_type = 0;
+            member->get_locationType(&loc_type);
+            current_.is_static = (loc_type == LocIsStatic);
+
+            BOOL virt = FALSE;
+            member->get_virtual(&virt);
+            current_.is_virtual = (virt != FALSE);
+
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedMember& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
+    PdbSession& session_;
+    std::string udt_name_;
+
+    CComPtr<IDiaEnumSymbols> udts_;
+    CComPtr<IDiaSymbol> current_udt_;
+    DWORD parent_id_ = 0;
+    std::string parent_name_;
+    CComPtr<IDiaEnumSymbols> members_;
+
+    CachedMember current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
+
+    bool advance_udt() {
+        current_udt_.Release();
+        parent_id_ = 0;
+        parent_name_.clear();
+        members_.Release();
+
+        CComPtr<IDiaSymbol> udt;
+        ULONG fetched = 0;
+        while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            current_udt_ = udt;
+            current_udt_->get_symIndexId(&parent_id_);
+            parent_name_ = safe_symbol_name(current_udt_);
+            if (SUCCEEDED(current_udt_->findChildren(SymTagData, nullptr, nsNone, &members_)) && members_) {
+                return true;
+            }
+            udt.Release();
+            current_udt_.Release();
+            parent_id_ = 0;
+            parent_name_.clear();
+        }
+        return false;
+    }
+
+public:
+    UdtMembersByNameGenerator(PdbSession& session, std::string udt_name)
+        : session_(session)
+        , udt_name_(std::move(udt_name))
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            udts_ = session_.find_symbols(udt_name_, SymTagUDT);
+            if (!udts_) return false;
+            if (!advance_udt()) return false;
+        }
+
+        while (true) {
+            if (!members_) {
+                if (!advance_udt()) return false;
+            }
+
+            CComPtr<IDiaSymbol> member;
+            ULONG fetched = 0;
+            if (FAILED(members_->Next(1, &member, &fetched)) || fetched != 1) {
+                members_.Release();
+                continue;
+            }
+
+            current_ = {};
+            current_.parent_id = parent_id_;
+            current_.parent_name = parent_name_;
+
+            member->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(member);
+
+            CComPtr<IDiaSymbol> type;
+            if (SUCCEEDED(member->get_type(&type)) && type) {
+                current_.type_name = safe_symbol_name(type);
+                ULONGLONG len = 0;
+                type->get_length(&len);
+                current_.length = len;
+            }
+
+            LONG offset = 0;
+            member->get_offset(&offset);
+            current_.offset = static_cast<DWORD>(offset);
+
+            DWORD access = 0;
+            member->get_access(&access);
+            current_.access = access;
+
+            DWORD loc_type = 0;
+            member->get_locationType(&loc_type);
+            current_.is_static = (loc_type == LocIsStatic);
+
+            BOOL virt = FALSE;
+            member->get_virtual(&virt);
+            current_.is_virtual = (virt != FALSE);
+
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedMember& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class EnumValuesByIdGenerator : public xsql::Generator<CachedEnumValue> {
+    PdbSession& session_;
+    DWORD enum_id_ = 0;
+    bool started_ = false;
+    std::string enum_name_;
+    CComPtr<IDiaEnumSymbols> values_;
+    CachedEnumValue current_;
+    sqlite3_int64 rowid_ = -1;
+
+    static int64_t variant_to_int64(const VARIANT& v) {
+        switch (v.vt) {
+            case VT_I1: return v.cVal;
+            case VT_I2: return v.iVal;
+            case VT_I4: return v.lVal;
+            case VT_I8: return v.llVal;
+            case VT_UI1: return v.bVal;
+            case VT_UI2: return v.uiVal;
+            case VT_UI4: return v.ulVal;
+            case VT_UI8: return static_cast<int64_t>(v.ullVal);
+            case VT_INT: return v.intVal;
+            case VT_UINT: return v.uintVal;
+            default: return 0;
+        }
+    }
+
+public:
+    EnumValuesByIdGenerator(PdbSession& session, DWORD enum_id)
+        : session_(session)
+        , enum_id_(enum_id)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+
+            IDiaSession* dia_session = session_.session();
+            if (!dia_session) return false;
+
+            CComPtr<IDiaSymbol> en;
+            if (FAILED(dia_session->symbolById(enum_id_, &en)) || !en) return false;
+
+            DWORD tag = 0;
+            en->get_symTag(&tag);
+            if (static_cast<enum SymTagEnum>(tag) != SymTagEnum) return false;
+
+            enum_name_ = safe_symbol_name(en);
+            if (FAILED(en->findChildren(SymTagData, nullptr, nsNone, &values_)) || !values_) return false;
+        }
+
+        while (true) {
+            CComPtr<IDiaSymbol> val;
+            ULONG fetched = 0;
+            if (FAILED(values_->Next(1, &val, &fetched)) || fetched != 1) {
+                return false;
+            }
+
+            current_ = {};
+            current_.enum_id = enum_id_;
+            current_.enum_name = enum_name_;
+            val->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(val);
+
+            VARIANT v = {};
+            if (SUCCEEDED(val->get_value(&v))) {
+                current_.value = variant_to_int64(v);
+                VariantClear(&v);
+            }
+
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedEnumValue& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class EnumValuesByNameGenerator : public xsql::Generator<CachedEnumValue> {
+    PdbSession& session_;
+    std::string enum_name_;
+
+    CComPtr<IDiaEnumSymbols> enums_;
+    CComPtr<IDiaSymbol> current_enum_;
+    DWORD current_enum_id_ = 0;
+    std::string current_enum_name_;
+    CComPtr<IDiaEnumSymbols> values_;
+
+    CachedEnumValue current_;
+    sqlite3_int64 rowid_ = -1;
+    bool started_ = false;
+
+    bool advance_enum() {
+        current_enum_.Release();
+        current_enum_id_ = 0;
+        current_enum_name_.clear();
+        values_.Release();
+
+        CComPtr<IDiaSymbol> en;
+        ULONG fetched = 0;
+        while (SUCCEEDED(enums_->Next(1, &en, &fetched)) && fetched == 1) {
+            current_enum_ = en;
+            current_enum_->get_symIndexId(&current_enum_id_);
+            current_enum_name_ = safe_symbol_name(current_enum_);
+            if (SUCCEEDED(current_enum_->findChildren(SymTagData, nullptr, nsNone, &values_)) && values_) {
+                return true;
+            }
+            en.Release();
+            current_enum_.Release();
+            current_enum_id_ = 0;
+            current_enum_name_.clear();
+        }
+
+        return false;
+    }
+
+    static int64_t variant_to_int64(const VARIANT& v) {
+        switch (v.vt) {
+            case VT_I1: return v.cVal;
+            case VT_I2: return v.iVal;
+            case VT_I4: return v.lVal;
+            case VT_I8: return v.llVal;
+            case VT_UI1: return v.bVal;
+            case VT_UI2: return v.uiVal;
+            case VT_UI4: return v.ulVal;
+            case VT_UI8: return static_cast<int64_t>(v.ullVal);
+            case VT_INT: return v.intVal;
+            case VT_UINT: return v.uintVal;
+            default: return 0;
+        }
+    }
+
+public:
+    EnumValuesByNameGenerator(PdbSession& session, std::string enum_name)
+        : session_(session)
+        , enum_name_(std::move(enum_name))
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            enums_ = session_.find_symbols(enum_name_, SymTagEnum);
+            if (!enums_) return false;
+            if (!advance_enum()) return false;
+        }
+
+        while (true) {
+            if (!values_) {
+                if (!advance_enum()) return false;
+            }
+
+            CComPtr<IDiaSymbol> val;
+            ULONG fetched = 0;
+            if (FAILED(values_->Next(1, &val, &fetched)) || fetched != 1) {
+                values_.Release();
+                continue;
+            }
+
+            current_ = {};
+            current_.enum_id = current_enum_id_;
+            current_.enum_name = current_enum_name_;
+
+            val->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(val);
+
+            VARIANT v = {};
+            if (SUCCEEDED(val->get_value(&v))) {
+                current_.value = variant_to_int64(v);
+                VariantClear(&v);
+            }
+
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedEnumValue& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class BaseClassesByDerivedIdGenerator : public xsql::Generator<CachedBaseClass> {
+    PdbSession& session_;
+    DWORD derived_id_ = 0;
+    bool started_ = false;
+    std::string derived_name_;
+    CComPtr<IDiaEnumSymbols> bases_;
+    CachedBaseClass current_;
+    sqlite3_int64 rowid_ = -1;
+
+public:
+    BaseClassesByDerivedIdGenerator(PdbSession& session, DWORD derived_id)
+        : session_(session)
+        , derived_id_(derived_id)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+
+            IDiaSession* dia_session = session_.session();
+            if (!dia_session) return false;
+
+            CComPtr<IDiaSymbol> udt;
+            if (FAILED(dia_session->symbolById(derived_id_, &udt)) || !udt) return false;
+
+            DWORD tag = 0;
+            udt->get_symTag(&tag);
+            if (static_cast<enum SymTagEnum>(tag) != SymTagUDT) return false;
+
+            derived_name_ = safe_symbol_name(udt);
+            if (FAILED(udt->findChildren(SymTagBaseClass, nullptr, nsNone, &bases_)) || !bases_) return false;
+        }
+
+        while (true) {
+            CComPtr<IDiaSymbol> base;
+            ULONG fetched = 0;
+            if (FAILED(bases_->Next(1, &base, &fetched)) || fetched != 1) {
+                return false;
+            }
+
+            current_ = {};
+            current_.derived_id = derived_id_;
+            current_.derived_name = derived_name_;
+
+            CComPtr<IDiaSymbol> base_type;
+            if (SUCCEEDED(base->get_type(&base_type)) && base_type) {
+                base_type->get_symIndexId(&current_.base_id);
+                current_.base_name = safe_symbol_name(base_type);
+            }
+
+            LONG offset = 0;
+            base->get_offset(&offset);
+            current_.offset = static_cast<DWORD>(offset);
+
+            BOOL virt = FALSE;
+            base->get_virtualBaseClass(&virt);
+            current_.is_virtual = (virt != FALSE);
+
+            DWORD access = 0;
+            base->get_access(&access);
+            current_.access = access;
+
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedBaseClass& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class LocalOrParamByFuncIdGenerator : public xsql::Generator<CachedLocal> {
+    PdbSession& session_;
+    DWORD func_id_ = 0;
+    DWORD want_kind_ = 0;
+    bool started_ = false;
+    std::string func_name_;
+    CComPtr<IDiaEnumSymbols> data_syms_;
+    CachedLocal current_;
+    sqlite3_int64 rowid_ = -1;
+
+public:
+    LocalOrParamByFuncIdGenerator(PdbSession& session, DWORD func_id, DWORD want_kind)
+        : session_(session)
+        , func_id_(func_id)
+        , want_kind_(want_kind)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+
+            IDiaSession* dia_session = session_.session();
+            if (!dia_session) return false;
+
+            CComPtr<IDiaSymbol> func;
+            if (FAILED(dia_session->symbolById(func_id_, &func)) || !func) return false;
+
+            DWORD tag = 0;
+            func->get_symTag(&tag);
+            if (static_cast<enum SymTagEnum>(tag) != SymTagFunction) return false;
+
+            func_name_ = safe_symbol_name(func);
+            if (FAILED(func->findChildren(SymTagData, nullptr, nsNone, &data_syms_)) || !data_syms_) return false;
+        }
+
+        while (true) {
+            CComPtr<IDiaSymbol> data;
+            ULONG fetched = 0;
+            if (FAILED(data_syms_->Next(1, &data, &fetched)) || fetched != 1) {
+                return false;
+            }
+
+            DWORD data_kind = 0;
+            data->get_dataKind(&data_kind);
+            if (data_kind != want_kind_) {
+                data.Release();
+                continue;
+            }
+
+            current_ = {};
+            current_.func_id = func_id_;
+            current_.func_name = func_name_;
+            data->get_symIndexId(&current_.id);
+            current_.name = safe_symbol_name(data);
+
+            CComPtr<IDiaSymbol> type;
+            if (SUCCEEDED(data->get_type(&type)) && type) {
+                current_.type_name = safe_symbol_name(type);
+            }
+
+            DWORD loc_type = 0;
+            data->get_locationType(&loc_type);
+            current_.location_type = loc_type;
+
+            LONG offset = 0;
+            DWORD reg = 0;
+            data->get_offset(&offset);
+            data->get_registerId(&reg);
+            current_.offset_or_register = (loc_type == LocIsRegRel) ? offset : static_cast<int64_t>(reg);
+
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedLocal& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
+
+class LineNumbersByCompilandIdGenerator : public xsql::Generator<CachedLineNumber> {
+    PdbSession& session_;
+    DWORD compiland_id_ = 0;
+    bool started_ = false;
+    CComPtr<IDiaSession> dia_session_;
+    CComPtr<IDiaSymbol> compiland_;
+    CComPtr<IDiaEnumSourceFiles> source_files_;
+    CComPtr<IDiaEnumLineNumbers> lines_;
+    CachedLineNumber current_;
+    sqlite3_int64 rowid_ = -1;
+
+    bool advance_file() {
+        if (!source_files_) return false;
+
+        lines_.Release();
+
+        CComPtr<IDiaSourceFile> file;
+        ULONG fetched = 0;
+        while (SUCCEEDED(source_files_->Next(1, &file, &fetched)) && fetched == 1) {
+            if (SUCCEEDED(dia_session_->findLines(compiland_, file, &lines_)) && lines_) {
+                return true;
+            }
+            file.Release();
+        }
+
+        source_files_.Release();
+        return false;
+    }
+
+public:
+    LineNumbersByCompilandIdGenerator(PdbSession& session, DWORD compiland_id)
+        : session_(session)
+        , compiland_id_(compiland_id)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+
+            dia_session_ = session_.session();
+            if (!dia_session_) return false;
+
+            if (FAILED(dia_session_->symbolById(compiland_id_, &compiland_)) || !compiland_) return false;
+
+            DWORD tag = 0;
+            compiland_->get_symTag(&tag);
+            if (static_cast<enum SymTagEnum>(tag) != SymTagCompiland) return false;
+
+            if (FAILED(dia_session_->findFile(compiland_, nullptr, nsNone, &source_files_)) || !source_files_) return false;
+        }
+
+        while (true) {
+            if (!lines_) {
+                if (!advance_file()) return false;
+            }
+
+            CComPtr<IDiaLineNumber> line;
+            ULONG fetched = 0;
+            if (FAILED(lines_->Next(1, &line, &fetched)) || fetched != 1) {
+                lines_.Release();
+                continue;
+            }
+
+            current_ = {};
+            line->get_sourceFileId(&current_.file_id);
+            line->get_lineNumber(&current_.line);
+            line->get_columnNumber(&current_.column);
+            line->get_relativeVirtualAddress(&current_.rva);
+            line->get_length(&current_.length);
+            current_.compiland_id = compiland_id_;
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedLineNumber& current() const override { return current_; }
+    sqlite3_int64 rowid() const override { return rowid_; }
+};
 
 // ============================================================================
 // Table Definitions
 // ============================================================================
 
 // Functions table
-inline VTableDef define_functions_table(PdbSession& session) {
-    return table("functions")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagFunction);
-            return get_symbol_cache(SymTagFunction).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagFunction)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagFunction)[i].name;
-        })
-        .column_text("undecorated", [](size_t i) {
-            return get_symbol_cache(SymTagFunction)[i].undecorated;
-        })
-        .column_int64("rva", [](size_t i) {
-            return get_symbol_cache(SymTagFunction)[i].rva;
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_symbol_cache(SymTagFunction)[i].length);
-        })
-        .column_int("section", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagFunction)[i].section);
-        })
-        .column_int("offset", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagFunction)[i].offset);
-        })
+inline GeneratorTableDef<CachedSymbol> define_functions_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("functions")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagFunction)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagFunction); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_text("undecorated", [](const CachedSymbol& r) { return r.undecorated; })
+        .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
+        .column_int("section", [](const CachedSymbol& r) { return static_cast<int>(r.section); })
+        .column_int("offset", [](const CachedSymbol& r) { return static_cast<int>(r.offset); })
         .build();
 }
 
 // Public symbols table
-inline VTableDef define_publics_table(PdbSession& session) {
-    return table("publics")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagPublicSymbol);
-            return get_symbol_cache(SymTagPublicSymbol).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagPublicSymbol)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagPublicSymbol)[i].name;
-        })
-        .column_text("undecorated", [](size_t i) {
-            return get_symbol_cache(SymTagPublicSymbol)[i].undecorated;
-        })
-        .column_int64("rva", [](size_t i) {
-            return get_symbol_cache(SymTagPublicSymbol)[i].rva;
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_symbol_cache(SymTagPublicSymbol)[i].length);
-        })
-        .column_int("section", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagPublicSymbol)[i].section);
-        })
-        .column_int("offset", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagPublicSymbol)[i].offset);
-        })
+inline GeneratorTableDef<CachedSymbol> define_publics_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("publics")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagPublicSymbol)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagPublicSymbol); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_text("undecorated", [](const CachedSymbol& r) { return r.undecorated; })
+        .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
+        .column_int("section", [](const CachedSymbol& r) { return static_cast<int>(r.section); })
+        .column_int("offset", [](const CachedSymbol& r) { return static_cast<int>(r.offset); })
         .build();
 }
 
 // Data symbols table
-inline VTableDef define_data_table(PdbSession& session) {
-    return table("data")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagData);
-            return get_symbol_cache(SymTagData).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagData)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagData)[i].name;
-        })
-        .column_int64("rva", [](size_t i) {
-            return get_symbol_cache(SymTagData)[i].rva;
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_symbol_cache(SymTagData)[i].length);
-        })
-        .column_int("section", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagData)[i].section);
-        })
-        .column_int("offset", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagData)[i].offset);
-        })
+inline GeneratorTableDef<CachedSymbol> define_data_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("data")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagData)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagData); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
+        .column_int("section", [](const CachedSymbol& r) { return static_cast<int>(r.section); })
+        .column_int("offset", [](const CachedSymbol& r) { return static_cast<int>(r.offset); })
         .build();
 }
 
 // UDT (structs/classes) table
-inline VTableDef define_udts_table(PdbSession& session) {
-    return table("udts")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagUDT);
-            return get_symbol_cache(SymTagUDT).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagUDT)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagUDT)[i].name;
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_symbol_cache(SymTagUDT)[i].length);
-        })
+inline GeneratorTableDef<CachedSymbol> define_udts_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("udts")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagUDT)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagUDT); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
         .build();
 }
 
 // Enums table
-inline VTableDef define_enums_table(PdbSession& session) {
-    return table("enums")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagEnum);
-            return get_symbol_cache(SymTagEnum).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagEnum)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagEnum)[i].name;
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_symbol_cache(SymTagEnum)[i].length);
-        })
+inline GeneratorTableDef<CachedSymbol> define_enums_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("enums")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagEnum)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagEnum); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
         .build();
 }
 
 // Typedefs table
-inline VTableDef define_typedefs_table(PdbSession& session) {
-    return table("typedefs")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagTypedef);
-            return get_symbol_cache(SymTagTypedef).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagTypedef)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagTypedef)[i].name;
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_symbol_cache(SymTagTypedef)[i].length);
-        })
+inline GeneratorTableDef<CachedSymbol> define_typedefs_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("typedefs")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagTypedef)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagTypedef); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
         .build();
 }
 
 // Compilands table
-inline VTableDef define_compilands_table(PdbSession& session) {
-    return table("compilands")
-        .count([&session]() {
-            rebuild_compiland_cache(session);
-            return get_compiland_cache().size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_compiland_cache()[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_compiland_cache()[i].name;
-        })
-        .column_text("library", [](size_t i) {
-            return get_compiland_cache()[i].library_name;
-        })
-        .column_int("language", [](size_t i) {
-            return static_cast<int>(get_compiland_cache()[i].language);
-        })
+inline GeneratorTableDef<CachedCompiland> define_compilands_table(PdbSession& session) {
+    return generator_table<CachedCompiland>("compilands")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagCompiland)); })
+        .generator([&session]() { return std::make_unique<CompilandGenerator>(session); })
+        .column_int64("id", [](const CachedCompiland& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedCompiland& r) { return r.name; })
+        .column_text("library", [](const CachedCompiland& r) { return r.library_name; })
+        .column_int("language", [](const CachedCompiland& r) { return static_cast<int>(r.language); })
         .build();
 }
 
 // Source files table
-inline VTableDef define_source_files_table(PdbSession& session) {
-    return table("source_files")
-        .count([&session]() {
-            rebuild_source_file_cache(session);
-            return get_source_file_cache().size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_source_file_cache()[i].id;
-        })
-        .column_text("filename", [](size_t i) {
-            return get_source_file_cache()[i].filename;
-        })
-        .column_int("checksum_type", [](size_t i) {
-            return static_cast<int>(get_source_file_cache()[i].checksum_type);
-        })
+inline GeneratorTableDef<CachedSourceFile> define_source_files_table(PdbSession& session) {
+    return generator_table<CachedSourceFile>("source_files")
+        .estimate_rows([]() { return static_cast<size_t>(1000); })
+        .generator([&session]() { return std::make_unique<SourceFileGenerator>(session); })
+        .column_int64("id", [](const CachedSourceFile& r) { return static_cast<int64_t>(r.id); })
+        .column_text("filename", [](const CachedSourceFile& r) { return r.filename; })
+        .column_int("checksum_type", [](const CachedSourceFile& r) { return static_cast<int>(r.checksum_type); })
         .build();
 }
 
 // Line numbers table
-inline VTableDef define_line_numbers_table(PdbSession& session) {
-    return table("line_numbers")
-        .count([&session]() {
-            rebuild_line_number_cache(session);
-            return get_line_number_cache().size();
-        })
-        .column_int64("file_id", [](size_t i) {
-            return get_line_number_cache()[i].file_id;
-        })
-        .column_int("line", [](size_t i) {
-            return static_cast<int>(get_line_number_cache()[i].line);
-        })
-        .column_int("column", [](size_t i) {
-            return static_cast<int>(get_line_number_cache()[i].column);
-        })
-        .column_int64("rva", [](size_t i) {
-            return get_line_number_cache()[i].rva;
-        })
-        .column_int("length", [](size_t i) {
-            return static_cast<int>(get_line_number_cache()[i].length);
-        })
-        .column_int64("compiland_id", [](size_t i) {
-            return get_line_number_cache()[i].compiland_id;
-        })
+inline GeneratorTableDef<CachedLineNumber> define_line_numbers_table(PdbSession& session) {
+    return generator_table<CachedLineNumber>("line_numbers")
+        .estimate_rows([]() { return static_cast<size_t>(100000); })
+        .generator([&session]() { return std::make_unique<LineNumberGenerator>(session); })
+        .column_int64("file_id", [](const CachedLineNumber& r) { return static_cast<int64_t>(r.file_id); })
+        .column_int("line", [](const CachedLineNumber& r) { return static_cast<int>(r.line); })
+        .column_int("column", [](const CachedLineNumber& r) { return static_cast<int>(r.column); })
+        .column_int64("rva", [](const CachedLineNumber& r) { return static_cast<int64_t>(r.rva); })
+        .column_int("length", [](const CachedLineNumber& r) { return static_cast<int>(r.length); })
+        .column_int64("compiland_id", [](const CachedLineNumber& r) { return static_cast<int64_t>(r.compiland_id); })
         .build();
 }
 
 // Sections table
-inline VTableDef define_sections_table(PdbSession& session) {
-    return table("sections")
-        .count([&session]() {
-            rebuild_section_cache(session);
-            return get_section_cache().size();
-        })
-        .column_int("number", [](size_t i) {
-            return static_cast<int>(get_section_cache()[i].section_number);
-        })
-        .column_int64("rva", [](size_t i) {
-            return get_section_cache()[i].rva;
-        })
-        .column_int("length", [](size_t i) {
-            return static_cast<int>(get_section_cache()[i].length);
-        })
-        .column_int("characteristics", [](size_t i) {
-            return static_cast<int>(get_section_cache()[i].characteristics);
-        })
-        .column_int("readable", [](size_t i) {
-            return get_section_cache()[i].read ? 1 : 0;
-        })
-        .column_int("writable", [](size_t i) {
-            return get_section_cache()[i].write ? 1 : 0;
-        })
-        .column_int("executable", [](size_t i) {
-            return get_section_cache()[i].execute ? 1 : 0;
-        })
-        .column_int("code", [](size_t i) {
-            return get_section_cache()[i].code ? 1 : 0;
-        })
+inline GeneratorTableDef<CachedSection> define_sections_table(PdbSession& session) {
+    return generator_table<CachedSection>("sections")
+        .estimate_rows([]() { return static_cast<size_t>(128); })
+        .generator([&session]() { return std::make_unique<SectionGenerator>(session); })
+        .column_int("number", [](const CachedSection& r) { return static_cast<int>(r.section_number); })
+        .column_int64("rva", [](const CachedSection& r) { return static_cast<int64_t>(r.rva); })
+        .column_int("length", [](const CachedSection& r) { return static_cast<int>(r.length); })
+        .column_int("characteristics", [](const CachedSection& r) { return static_cast<int>(r.characteristics); })
+        .column_int("readable", [](const CachedSection& r) { return r.read ? 1 : 0; })
+        .column_int("writable", [](const CachedSection& r) { return r.write ? 1 : 0; })
+        .column_int("executable", [](const CachedSection& r) { return r.execute ? 1 : 0; })
+        .column_int("code", [](const CachedSection& r) { return r.code ? 1 : 0; })
         .build();
 }
 
 // Thunks table
-inline VTableDef define_thunks_table(PdbSession& session) {
-    return table("thunks")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagThunk);
-            return get_symbol_cache(SymTagThunk).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagThunk)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagThunk)[i].name;
-        })
-        .column_int64("rva", [](size_t i) {
-            return get_symbol_cache(SymTagThunk)[i].rva;
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_symbol_cache(SymTagThunk)[i].length);
-        })
-        .column_int("section", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagThunk)[i].section);
-        })
+inline GeneratorTableDef<CachedSymbol> define_thunks_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("thunks")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagThunk)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagThunk); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
+        .column_int("section", [](const CachedSymbol& r) { return static_cast<int>(r.section); })
         .build();
 }
 
 // Labels table
-inline VTableDef define_labels_table(PdbSession& session) {
-    return table("labels")
-        .count([&session]() {
-            rebuild_symbol_cache(session, SymTagLabel);
-            return get_symbol_cache(SymTagLabel).size();
-        })
-        .column_int64("id", [](size_t i) {
-            return get_symbol_cache(SymTagLabel)[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_symbol_cache(SymTagLabel)[i].name;
-        })
-        .column_int64("rva", [](size_t i) {
-            return get_symbol_cache(SymTagLabel)[i].rva;
-        })
-        .column_int("section", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagLabel)[i].section);
-        })
-        .column_int("offset", [](size_t i) {
-            return static_cast<int>(get_symbol_cache(SymTagLabel)[i].offset);
-        })
+inline GeneratorTableDef<CachedSymbol> define_labels_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("labels")
+        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagLabel)); })
+        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagLabel); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
+        .column_int("section", [](const CachedSymbol& r) { return static_cast<int>(r.section); })
+        .column_int("offset", [](const CachedSymbol& r) { return static_cast<int>(r.offset); })
         .build();
 }
 
 // UDT members table
-inline VTableDef define_udt_members_table(PdbSession& session) {
-    return table("udt_members")
-        .count([&session]() {
-            rebuild_member_cache(session);
-            return get_member_cache().size();
-        })
-        .column_int64("udt_id", [](size_t i) {
-            return get_member_cache()[i].parent_id;
-        })
-        .column_text("udt_name", [](size_t i) {
-            return get_member_cache()[i].parent_name;
-        })
-        .column_int64("id", [](size_t i) {
-            return get_member_cache()[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_member_cache()[i].name;
-        })
-        .column_text("type", [](size_t i) {
-            return get_member_cache()[i].type_name;
-        })
-        .column_int("offset", [](size_t i) {
-            return static_cast<int>(get_member_cache()[i].offset);
-        })
-        .column_int64("length", [](size_t i) {
-            return static_cast<int64_t>(get_member_cache()[i].length);
-        })
-        .column_int("access", [](size_t i) {
-            return static_cast<int>(get_member_cache()[i].access);
-        })
-        .column_int("is_static", [](size_t i) {
-            return get_member_cache()[i].is_static ? 1 : 0;
-        })
-        .column_int("is_virtual", [](size_t i) {
-            return get_member_cache()[i].is_virtual ? 1 : 0;
-        })
+inline GeneratorTableDef<CachedMember> define_udt_members_table(PdbSession& session) {
+    return generator_table<CachedMember>("udt_members")
+        .estimate_rows([]() { return static_cast<size_t>(100000); })
+        .generator([&session]() { return std::make_unique<MemberGenerator>(session); })
+        .column_int64("udt_id", [](const CachedMember& r) { return static_cast<int64_t>(r.parent_id); })
+        .column_text("udt_name", [](const CachedMember& r) { return r.parent_name; })
+        .column_int64("id", [](const CachedMember& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedMember& r) { return r.name; })
+        .column_text("type", [](const CachedMember& r) { return r.type_name; })
+        .column_int("offset", [](const CachedMember& r) { return static_cast<int>(r.offset); })
+        .column_int64("length", [](const CachedMember& r) { return static_cast<int64_t>(r.length); })
+        .column_int("access", [](const CachedMember& r) { return static_cast<int>(r.access); })
+        .column_int("is_static", [](const CachedMember& r) { return r.is_static ? 1 : 0; })
+        .column_int("is_virtual", [](const CachedMember& r) { return r.is_virtual ? 1 : 0; })
         .build();
 }
 
 // Enum values table
-inline VTableDef define_enum_values_table(PdbSession& session) {
-    return table("enum_values")
-        .count([&session]() {
-            rebuild_enum_value_cache(session);
-            return get_enum_value_cache().size();
-        })
-        .column_int64("enum_id", [](size_t i) {
-            return get_enum_value_cache()[i].enum_id;
-        })
-        .column_text("enum_name", [](size_t i) {
-            return get_enum_value_cache()[i].enum_name;
-        })
-        .column_int64("id", [](size_t i) {
-            return get_enum_value_cache()[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_enum_value_cache()[i].name;
-        })
-        .column_int64("value", [](size_t i) {
-            return get_enum_value_cache()[i].value;
-        })
+inline GeneratorTableDef<CachedEnumValue> define_enum_values_table(PdbSession& session) {
+    return generator_table<CachedEnumValue>("enum_values")
+        .estimate_rows([]() { return static_cast<size_t>(100000); })
+        .generator([&session]() { return std::make_unique<EnumValueGenerator>(session); })
+        .column_int64("enum_id", [](const CachedEnumValue& r) { return static_cast<int64_t>(r.enum_id); })
+        .column_text("enum_name", [](const CachedEnumValue& r) { return r.enum_name; })
+        .column_int64("id", [](const CachedEnumValue& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedEnumValue& r) { return r.name; })
+        .column_int64("value", [](const CachedEnumValue& r) { return r.value; })
         .build();
 }
 
 // Base classes table
-inline VTableDef define_base_classes_table(PdbSession& session) {
-    return table("base_classes")
-        .count([&session]() {
-            rebuild_base_class_cache(session);
-            return get_base_class_cache().size();
-        })
-        .column_int64("derived_id", [](size_t i) {
-            return get_base_class_cache()[i].derived_id;
-        })
-        .column_text("derived_name", [](size_t i) {
-            return get_base_class_cache()[i].derived_name;
-        })
-        .column_int64("base_id", [](size_t i) {
-            return get_base_class_cache()[i].base_id;
-        })
-        .column_text("base_name", [](size_t i) {
-            return get_base_class_cache()[i].base_name;
-        })
-        .column_int("offset", [](size_t i) {
-            return static_cast<int>(get_base_class_cache()[i].offset);
-        })
-        .column_int("is_virtual", [](size_t i) {
-            return get_base_class_cache()[i].is_virtual ? 1 : 0;
-        })
-        .column_int("access", [](size_t i) {
-            return static_cast<int>(get_base_class_cache()[i].access);
-        })
+inline GeneratorTableDef<CachedBaseClass> define_base_classes_table(PdbSession& session) {
+    return generator_table<CachedBaseClass>("base_classes")
+        .estimate_rows([]() { return static_cast<size_t>(100000); })
+        .generator([&session]() { return std::make_unique<BaseClassGenerator>(session); })
+        .column_int64("derived_id", [](const CachedBaseClass& r) { return static_cast<int64_t>(r.derived_id); })
+        .column_text("derived_name", [](const CachedBaseClass& r) { return r.derived_name; })
+        .column_int64("base_id", [](const CachedBaseClass& r) { return static_cast<int64_t>(r.base_id); })
+        .column_text("base_name", [](const CachedBaseClass& r) { return r.base_name; })
+        .column_int("offset", [](const CachedBaseClass& r) { return static_cast<int>(r.offset); })
+        .column_int("is_virtual", [](const CachedBaseClass& r) { return r.is_virtual ? 1 : 0; })
+        .column_int("access", [](const CachedBaseClass& r) { return static_cast<int>(r.access); })
         .build();
 }
 
 // Locals table
-inline VTableDef define_locals_table(PdbSession& session) {
-    return table("locals")
-        .count([&session]() {
-            rebuild_local_and_param_caches(session);
-            return get_local_cache().size();
-        })
-        .column_int64("func_id", [](size_t i) {
-            return get_local_cache()[i].func_id;
-        })
-        .column_text("func_name", [](size_t i) {
-            return get_local_cache()[i].func_name;
-        })
-        .column_int64("id", [](size_t i) {
-            return get_local_cache()[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_local_cache()[i].name;
-        })
-        .column_text("type", [](size_t i) {
-            return get_local_cache()[i].type_name;
-        })
-        .column_int("location_type", [](size_t i) {
-            return static_cast<int>(get_local_cache()[i].location_type);
-        })
-        .column_int64("offset_or_register", [](size_t i) {
-            return get_local_cache()[i].offset_or_register;
-        })
+inline GeneratorTableDef<CachedLocal> define_locals_table(PdbSession& session) {
+    return generator_table<CachedLocal>("locals")
+        .estimate_rows([]() { return static_cast<size_t>(100000); })
+        .generator([&session]() { return std::make_unique<LocalOrParamGenerator>(session, DataIsLocal); })
+        .column_int64("func_id", [](const CachedLocal& r) { return static_cast<int64_t>(r.func_id); })
+        .column_text("func_name", [](const CachedLocal& r) { return r.func_name; })
+        .column_int64("id", [](const CachedLocal& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedLocal& r) { return r.name; })
+        .column_text("type", [](const CachedLocal& r) { return r.type_name; })
+        .column_int("location_type", [](const CachedLocal& r) { return static_cast<int>(r.location_type); })
+        .column_int64("offset_or_register", [](const CachedLocal& r) { return r.offset_or_register; })
         .build();
 }
 
 // Parameters table
-inline VTableDef define_parameters_table(PdbSession& session) {
-    return table("parameters")
-        .count([&session]() {
-            rebuild_local_and_param_caches(session);
-            return get_parameter_cache().size();
-        })
-        .column_int64("func_id", [](size_t i) {
-            return get_parameter_cache()[i].func_id;
-        })
-        .column_text("func_name", [](size_t i) {
-            return get_parameter_cache()[i].func_name;
-        })
-        .column_int64("id", [](size_t i) {
-            return get_parameter_cache()[i].id;
-        })
-        .column_text("name", [](size_t i) {
-            return get_parameter_cache()[i].name;
-        })
-        .column_text("type", [](size_t i) {
-            return get_parameter_cache()[i].type_name;
-        })
-        .column_int("location_type", [](size_t i) {
-            return static_cast<int>(get_parameter_cache()[i].location_type);
-        })
-        .column_int64("offset_or_register", [](size_t i) {
-            return get_parameter_cache()[i].offset_or_register;
-        })
+inline GeneratorTableDef<CachedLocal> define_parameters_table(PdbSession& session) {
+    return generator_table<CachedLocal>("parameters")
+        .estimate_rows([]() { return static_cast<size_t>(100000); })
+        .generator([&session]() { return std::make_unique<LocalOrParamGenerator>(session, DataIsParam); })
+        .column_int64("func_id", [](const CachedLocal& r) { return static_cast<int64_t>(r.func_id); })
+        .column_text("func_name", [](const CachedLocal& r) { return r.func_name; })
+        .column_int64("id", [](const CachedLocal& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedLocal& r) { return r.name; })
+        .column_text("type", [](const CachedLocal& r) { return r.type_name; })
+        .column_int("location_type", [](const CachedLocal& r) { return static_cast<int>(r.location_type); })
+        .column_int64("offset_or_register", [](const CachedLocal& r) { return r.offset_or_register; })
         .build();
 }
 
@@ -1184,46 +2021,288 @@ inline VTableDef define_parameters_table(PdbSession& session) {
 // ============================================================================
 
 class TableRegistry {
-    std::vector<VTableDef> defs_;
     PdbSession& session_;
 
+    GeneratorTableDef<CachedSymbol> functions_;
+    GeneratorTableDef<CachedSymbol> publics_;
+    GeneratorTableDef<CachedSymbol> data_;
+    GeneratorTableDef<CachedSymbol> udts_;
+    GeneratorTableDef<CachedSymbol> enums_;
+    GeneratorTableDef<CachedSymbol> typedefs_;
+    GeneratorTableDef<CachedSymbol> thunks_;
+    GeneratorTableDef<CachedSymbol> labels_;
+
+    GeneratorTableDef<CachedCompiland> compilands_;
+    GeneratorTableDef<CachedSourceFile> source_files_;
+    GeneratorTableDef<CachedLineNumber> line_numbers_;
+
+    GeneratorTableDef<CachedSection> sections_;
+
+    GeneratorTableDef<CachedMember> udt_members_;
+    GeneratorTableDef<CachedEnumValue> enum_values_;
+    GeneratorTableDef<CachedBaseClass> base_classes_;
+
+    GeneratorTableDef<CachedLocal> locals_;
+    GeneratorTableDef<CachedLocal> parameters_;
+
+    template<typename RowData>
+    static void register_one(sqlite3* db, GeneratorTableDef<RowData>& def) {
+        std::string module_name = "pdb_" + def.name;
+        register_generator_vtable(db, module_name.c_str(), &def);
+        create_vtable(db, def.name.c_str(), module_name.c_str());
+    }
+
 public:
-    explicit TableRegistry(PdbSession& session) : session_(session) {}
+    explicit TableRegistry(PdbSession& session)
+        : session_(session)
+        , functions_(define_functions_table(session_))
+        , publics_(define_publics_table(session_))
+        , data_(define_data_table(session_))
+        , udts_(define_udts_table(session_))
+        , enums_(define_enums_table(session_))
+        , typedefs_(define_typedefs_table(session_))
+        , thunks_(define_thunks_table(session_))
+        , labels_(define_labels_table(session_))
+        , compilands_(define_compilands_table(session_))
+        , source_files_(define_source_files_table(session_))
+        , line_numbers_(define_line_numbers_table(session_))
+        , sections_(define_sections_table(session_))
+        , udt_members_(define_udt_members_table(session_))
+        , enum_values_(define_enum_values_table(session_))
+        , base_classes_(define_base_classes_table(session_))
+        , locals_(define_locals_table(session_))
+        , parameters_(define_parameters_table(session_))
+    {
+        auto* functions_def = &functions_;
+        add_filter_eq(functions_, "id",
+                      [functions_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(functions_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              functions_def,
+                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), SymTagFunction));
+                      },
+                      1.0, 1.0);
+        add_filter_eq_text(functions_, "name",
+                           [functions_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                   functions_def,
+                                   std::make_unique<SymbolByNameGenerator>(session_, SymTagFunction, name ? name : ""));
+                           },
+                           5.0, 10.0);
+
+        auto* publics_def = &publics_;
+        add_filter_eq(publics_, "id",
+                      [publics_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(publics_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              publics_def,
+                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), SymTagPublicSymbol));
+                      },
+                      1.0, 1.0);
+        add_filter_eq_text(publics_, "name",
+                           [publics_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                   publics_def,
+                                   std::make_unique<SymbolByNameGenerator>(session_, SymTagPublicSymbol, name ? name : ""));
+                           },
+                           5.0, 10.0);
+
+        auto* data_def = &data_;
+        add_filter_eq(data_, "id",
+                      [data_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(data_def, nullptr);
+                          }
+                          auto accept = [](IDiaSymbol* symbol) -> bool {
+                              if (!symbol) return false;
+                              DWORD kind = 0;
+                              if (FAILED(symbol->get_dataKind(&kind))) return false;
+                              return kind == DataIsFileStatic || kind == DataIsGlobal || kind == DataIsConstant;
+                          };
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              data_def,
+                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), SymTagData, accept));
+                      },
+                      1.0, 1.0);
+        add_filter_eq_text(data_, "name",
+                           [data_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                   data_def,
+                                   std::make_unique<SymbolByNameGenerator>(session_, SymTagData, name ? name : ""));
+                           },
+                           5.0, 10.0);
+
+        auto add_name_and_id_filters = [this](GeneratorTableDef<CachedSymbol>& def, enum SymTagEnum tag) {
+            auto* def_ptr = &def;
+            add_filter_eq(def, "id",
+                          [def_ptr, this, tag](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                              if (id <= 0 || id > 0xFFFFFFFFLL) {
+                                  return std::make_unique<GeneratorRowIterator<CachedSymbol>>(def_ptr, nullptr);
+                              }
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                  def_ptr,
+                                  std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), tag));
+                          },
+                          1.0, 1.0);
+            add_filter_eq_text(def, "name",
+                               [def_ptr, this, tag](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                                   return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                       def_ptr,
+                                       std::make_unique<SymbolByNameGenerator>(session_, tag, name ? name : ""));
+                               },
+                               5.0, 10.0);
+        };
+
+        add_name_and_id_filters(udts_, SymTagUDT);
+        add_name_and_id_filters(enums_, SymTagEnum);
+        add_name_and_id_filters(typedefs_, SymTagTypedef);
+        add_name_and_id_filters(thunks_, SymTagThunk);
+        add_name_and_id_filters(labels_, SymTagLabel);
+
+        auto* compilands_def = &compilands_;
+        add_filter_eq(compilands_, "id",
+                      [compilands_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedCompiland>>(compilands_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedCompiland>>(
+                              compilands_def,
+                              std::make_unique<CompilandByIdGenerator>(session_, static_cast<DWORD>(id)));
+                      },
+                      1.0, 1.0);
+        add_filter_eq_text(compilands_, "name",
+                           [compilands_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedCompiland>>(
+                                   compilands_def,
+                                   std::make_unique<CompilandByNameGenerator>(session_, name ? name : ""));
+                           },
+                           5.0, 10.0);
+
+        auto* source_files_def = &source_files_;
+        add_filter_eq(source_files_, "id",
+                      [source_files_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSourceFile>>(source_files_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSourceFile>>(
+                              source_files_def,
+                              std::make_unique<SourceFileByIdGenerator>(session_, static_cast<DWORD>(id)));
+                      },
+                      1.0, 1.0);
+
+        auto* udt_members_def = &udt_members_;
+        add_filter_eq(udt_members_, "udt_id",
+                      [udt_members_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedMember>>(udt_members_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedMember>>(
+                              udt_members_def,
+                              std::make_unique<UdtMembersByIdGenerator>(session_, static_cast<DWORD>(id)));
+                      },
+                      10.0, 100.0);
+        add_filter_eq_text(udt_members_, "udt_name",
+                           [udt_members_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedMember>>(
+                                   udt_members_def,
+                                   std::make_unique<UdtMembersByNameGenerator>(session_, name ? name : ""));
+                           },
+                           10.0, 100.0);
+
+        auto* enum_values_def = &enum_values_;
+        add_filter_eq(enum_values_, "enum_id",
+                      [enum_values_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedEnumValue>>(enum_values_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedEnumValue>>(
+                              enum_values_def,
+                              std::make_unique<EnumValuesByIdGenerator>(session_, static_cast<DWORD>(id)));
+                      },
+                      10.0, 100.0);
+        add_filter_eq_text(enum_values_, "enum_name",
+                           [enum_values_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedEnumValue>>(
+                                   enum_values_def,
+                                   std::make_unique<EnumValuesByNameGenerator>(session_, name ? name : ""));
+                           },
+                           10.0, 100.0);
+
+        auto* base_classes_def = &base_classes_;
+        add_filter_eq(base_classes_, "derived_id",
+                      [base_classes_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedBaseClass>>(base_classes_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedBaseClass>>(
+                              base_classes_def,
+                              std::make_unique<BaseClassesByDerivedIdGenerator>(session_, static_cast<DWORD>(id)));
+                      },
+                      10.0, 100.0);
+
+        auto* locals_def = &locals_;
+        add_filter_eq(locals_, "func_id",
+                      [locals_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedLocal>>(locals_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedLocal>>(
+                              locals_def,
+                              std::make_unique<LocalOrParamByFuncIdGenerator>(session_, static_cast<DWORD>(id), DataIsLocal));
+                      },
+                      10.0, 100.0);
+
+        auto* params_def = &parameters_;
+        add_filter_eq(parameters_, "func_id",
+                      [params_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedLocal>>(params_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedLocal>>(
+                              params_def,
+                              std::make_unique<LocalOrParamByFuncIdGenerator>(session_, static_cast<DWORD>(id), DataIsParam));
+                      },
+                      10.0, 100.0);
+
+        auto* line_numbers_def = &line_numbers_;
+        add_filter_eq(line_numbers_, "compiland_id",
+                      [line_numbers_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedLineNumber>>(line_numbers_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedLineNumber>>(
+                              line_numbers_def,
+                              std::make_unique<LineNumbersByCompilandIdGenerator>(session_, static_cast<DWORD>(id)));
+                      },
+                      50.0, 1000.0);
+    }
 
     void register_all(sqlite3* db) {
-        // Core symbol tables
-        defs_.push_back(define_functions_table(session_));
-        defs_.push_back(define_publics_table(session_));
-        defs_.push_back(define_data_table(session_));
-        defs_.push_back(define_udts_table(session_));
-        defs_.push_back(define_enums_table(session_));
-        defs_.push_back(define_typedefs_table(session_));
-        defs_.push_back(define_thunks_table(session_));
-        defs_.push_back(define_labels_table(session_));
+        register_one(db, functions_);
+        register_one(db, publics_);
+        register_one(db, data_);
+        register_one(db, udts_);
+        register_one(db, enums_);
+        register_one(db, typedefs_);
+        register_one(db, thunks_);
+        register_one(db, labels_);
 
-        // Compilation unit tables
-        defs_.push_back(define_compilands_table(session_));
-        defs_.push_back(define_source_files_table(session_));
-        defs_.push_back(define_line_numbers_table(session_));
+        register_one(db, compilands_);
+        register_one(db, source_files_);
+        register_one(db, line_numbers_);
 
-        // Structure tables
-        defs_.push_back(define_sections_table(session_));
+        register_one(db, sections_);
 
-        // Type hierarchy tables
-        defs_.push_back(define_udt_members_table(session_));
-        defs_.push_back(define_enum_values_table(session_));
-        defs_.push_back(define_base_classes_table(session_));
+        register_one(db, udt_members_);
+        register_one(db, enum_values_);
+        register_one(db, base_classes_);
 
-        // Function detail tables
-        defs_.push_back(define_locals_table(session_));
-        defs_.push_back(define_parameters_table(session_));
-
-        // Register and create each table
-        for (auto& def : defs_) {
-            std::string module_name = "pdb_" + def.name;
-            register_vtable(db, module_name.c_str(), &def);
-            create_vtable(db, def.name.c_str(), module_name.c_str());
-        }
+        register_one(db, locals_);
+        register_one(db, parameters_);
     }
 };
 

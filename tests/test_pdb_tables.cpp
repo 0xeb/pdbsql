@@ -71,6 +71,25 @@ protected:
         }
         return result;
     }
+
+    std::string get_query_plan_detail(const char* sql) {
+        std::string result;
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            if (stmt) sqlite3_finalize(stmt);
+            return result;
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+            if (!text) continue;
+            if (!result.empty()) result += "\n";
+            result += text;
+        }
+
+        sqlite3_finalize(stmt);
+        return result;
+    }
 };
 
 // ============================================================================
@@ -259,4 +278,41 @@ TEST_F(PdbTablesTest, OrderByQuery) {
 TEST_F(PdbTablesTest, LikeQuery) {
     int count = count_rows("SELECT * FROM functions WHERE name LIKE 'Counter::%'");
     EXPECT_GE(count, 3) << "Expected Counter::get, Counter::increment, Counter::add, Counter::Counter";
+}
+
+// ============================================================================
+// Query Plan / Constraint Pushdown Tests
+// ============================================================================
+
+TEST_F(PdbTablesTest, QueryPlanUsesNameEqFilter) {
+    std::string detail = get_query_plan_detail(
+        "EXPLAIN QUERY PLAN SELECT * FROM functions WHERE name = 'main'"
+    );
+    EXPECT_NE(detail.find("VIRTUAL TABLE INDEX"), std::string::npos);
+    EXPECT_EQ(detail.find("VIRTUAL TABLE INDEX 0"), std::string::npos);
+}
+
+TEST_F(PdbTablesTest, QueryPlanUsesIdEqFilter) {
+    int64_t id = get_int("SELECT id FROM functions WHERE name = 'main'");
+    ASSERT_GT(id, 0);
+
+    std::string sql = "EXPLAIN QUERY PLAN SELECT * FROM functions WHERE id = " + std::to_string(id);
+    std::string detail = get_query_plan_detail(sql.c_str());
+    EXPECT_NE(detail.find("VIRTUAL TABLE INDEX"), std::string::npos);
+    EXPECT_EQ(detail.find("VIRTUAL TABLE INDEX 0"), std::string::npos);
+}
+
+TEST_F(PdbTablesTest, QueryPlanUsesEnumNameEqFilter) {
+    std::string detail = get_query_plan_detail(
+        "EXPLAIN QUERY PLAN SELECT * FROM enum_values WHERE enum_name = 'Color'"
+    );
+    EXPECT_NE(detail.find("VIRTUAL TABLE INDEX"), std::string::npos);
+    EXPECT_EQ(detail.find("VIRTUAL TABLE INDEX 0"), std::string::npos);
+}
+
+TEST_F(PdbTablesTest, QueryPlanLikeStaysFullScan) {
+    std::string detail = get_query_plan_detail(
+        "EXPLAIN QUERY PLAN SELECT * FROM functions WHERE name LIKE 'Counter::%'"
+    );
+    EXPECT_NE(detail.find("VIRTUAL TABLE INDEX 0"), std::string::npos);
 }
