@@ -36,4 +36,4 @@ target_compile_definitions(pdbsql_tests PRIVATE
 )
 
 include(GoogleTest)
-gtest_discover_tests(pdbsql_tests)
+gtest_discover_tests(pdbsql_tests PROPERTIES TIMEOUT 20)
