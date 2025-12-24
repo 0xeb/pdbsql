@@ -122,9 +122,13 @@ void print_remote_result(const xsql::socket::RemoteResult& qr) {
 }
 
 int run_remote_mode(const std::string& host, int port,
-                    const std::string& query, bool interactive) {
-    std::cerr << "Connecting to " << host << ":" << port << "..." << std::endl;
+                    const std::string& query, const std::string& auth_token,
+                    bool interactive) {
+    std::cerr << "Connecting to " << host << ":" << port << "..." << std::endl; 
     xsql::socket::Client client;
+    if (!auth_token.empty()) {
+        client.set_auth_token(auth_token);
+    }
     if (!client.connect(host, port)) {
         std::cerr << "Error: " << client.error() << std::endl;
         return 1;
@@ -228,6 +232,7 @@ void print_usage(const char* prog) {
     printf("  %s <pdb_file> --server [port]       Start server (default: 13337)\n", prog);
     printf("  %s --remote host:port -q \"<query>\"  Execute SQL query (remote)\n", prog);
     printf("  %s --remote host:port -i            Interactive mode (remote)\n", prog);
+    printf("  %s --token <token>                  Auth token for server/remote mode\n", prog);
     printf("\nTables:\n");
     printf("  functions, publics, data, udts, enums, typedefs, thunks, labels\n");
     printf("  compilands, source_files, line_numbers, sections\n");
@@ -312,7 +317,7 @@ void dump_symbol_counts(pdbsql::PdbSession& session) {
 // Server Mode
 //=============================================================================
 
-int run_server_mode(const std::string& pdb_path, int port) {
+int run_server_mode(const std::string& pdb_path, int port, const std::string& auth_token) {
     // Open PDB
     pdbsql::PdbSession session;
     if (!session.open(pdb_path)) {
@@ -336,6 +341,11 @@ int run_server_mode(const std::string& pdb_path, int port) {
 
     // Create server
     xsql::socket::Server server;
+    if (!auth_token.empty()) {
+        xsql::socket::ServerConfig cfg;
+        cfg.auth_token = auth_token;
+        server.set_config(cfg);
+    }
     server.set_query_handler([db](const std::string& sql) -> xsql::socket::QueryResult {
         xsql::socket::QueryResult result;
 
@@ -394,6 +404,7 @@ int main(int argc, char* argv[]) {
     std::string pdb_path;
     std::string query;
     std::string remote_spec;
+    std::string auth_token;
     bool interactive = false;
     bool server_mode = false;
     int server_port = 13337;
@@ -415,6 +426,8 @@ int main(int argc, char* argv[]) {
             }
         } else if (strcmp(argv[i], "--remote") == 0 && i + 1 < argc) {
             remote_spec = argv[++i];
+        } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
+            auth_token = argv[++i];
         } else if (pdb_path.empty() && argv[i][0] != '-') {
             pdb_path = argv[i];
         } else if (query.empty() && argv[i][0] != '-') {
@@ -451,7 +464,7 @@ int main(int argc, char* argv[]) {
             host = remote_spec;
         }
 
-        return run_remote_mode(host, port, query, interactive);
+        return run_remote_mode(host, port, query, auth_token, interactive);
     }
 
     //=========================================================================
@@ -467,7 +480,7 @@ int main(int argc, char* argv[]) {
     // Server mode
     //=========================================================================
     if (server_mode) {
-        return run_server_mode(pdb_path, server_port);
+        return run_server_mode(pdb_path, server_port, auth_token);
     }
 
     //=========================================================================
