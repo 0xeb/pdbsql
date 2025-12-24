@@ -121,6 +121,19 @@ void print_remote_result(const xsql::socket::RemoteResult& qr) {
     printer.print();
 }
 
+static bool parse_port(const std::string& s, int& port) {
+    try {
+        size_t idx = 0;
+        int v = std::stoi(s, &idx, 10);
+        if (idx != s.size()) return false;
+        if (v < 1 || v > 65535) return false;
+        port = v;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 int run_remote_mode(const std::string& host, int port,
                     const std::string& query, const std::string& auth_token,
                     bool interactive) {
@@ -422,7 +435,11 @@ int main(int argc, char* argv[]) {
             server_mode = true;
             // Optional port argument
             if (i + 1 < argc && argv[i + 1][0] != '-') {
-                server_port = std::atoi(argv[++i]);
+                std::string port_str = argv[++i];
+                if (!parse_port(port_str, server_port)) {
+                    fprintf(stderr, "Invalid port: %s\n", port_str.c_str());
+                    return 1;
+                }
             }
         } else if (strcmp(argv[i], "--remote") == 0 && i + 1 < argc) {
             remote_spec = argv[++i];
@@ -459,7 +476,11 @@ int main(int argc, char* argv[]) {
         auto colon = remote_spec.find(':');
         if (colon != std::string::npos) {
             host = remote_spec.substr(0, colon);
-            port = std::stoi(remote_spec.substr(colon + 1));
+            std::string port_str = remote_spec.substr(colon + 1);
+            if (!parse_port(port_str, port)) {
+                fprintf(stderr, "Invalid port in --remote: %s\n", port_str.c_str());
+                return 1;
+            }
         } else {
             host = remote_spec;
         }
