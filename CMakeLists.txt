@@ -50,18 +50,21 @@ if(TARGET xsql::xsql)
     # Part of monorepo - already available via add_subdirectory
     message(STATUS "pdbsql: Using xsql::xsql from parent project")
 else()
-    # Standalone build - try find_package first, then fallback to sibling directory
+    # Standalone build - try find_package first, then submodule, then sibling
     find_package(xsql QUIET)
     if(xsql_FOUND)
         message(STATUS "pdbsql: Using xsql::xsql via find_package")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libxsql/CMakeLists.txt")
+        add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
+        message(STATUS "pdbsql: Added libxsql from submodule")
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libxsql/CMakeLists.txt")
         add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
-        message(STATUS "pdbsql: Added libxsql from sibling directory")
+        message(STATUS "pdbsql: Added libxsql from sibling directory (monorepo)")
     else()
         message(FATAL_ERROR "libxsql not found. Either:\n"
             "  1. Build as part of xsql monorepo\n"
-            "  2. Set xsql_DIR to the libxsql build directory\n"
-            "  3. Install libxsql and ensure it's in CMAKE_PREFIX_PATH")
+            "  2. Ensure libxsql submodule is initialized (git submodule update --init)\n"
+            "  3. Set xsql_DIR to the libxsql build directory")
     endif()
 endif()
 
