@@ -1,0 +1,11 @@
+# Build artifacts
+build*/
+release/
+
+# IDE
+.vs/
+.vscode/
+*.user
+
+# Agent guidelines (private)
+AGENTS.md
