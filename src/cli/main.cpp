@@ -275,6 +275,7 @@ void print_usage(const char* prog) {
     printf("  %s <pdb_file> --prompt \"<text>\"     Natural language query (AI agent)\n", prog);
     printf("  %s <pdb_file> -i --agent            Interactive mode with AI agent\n", prog);
     printf("  %s <pdb_file> --provider <name>     Override AI provider (claude, copilot)\n", prog);
+    printf("  %s --config [path] [value]          View/set agent configuration\n", prog);
     printf("  %s <pdb_file> -v                    Show agent debug logs\n", prog);
 #endif
     printf("\nTables:\n");
@@ -647,6 +648,13 @@ int main(int argc, char* argv[]) {
                 fprintf(stderr, "Invalid provider: %s (use 'claude' or 'copilot')\n", provider_override.c_str());
                 return 1;
             }
+        } else if (strcmp(argv[i], "--config") == 0) {
+            // Handle --config [path] [value] and exit immediately
+            std::string config_path = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : "";
+            std::string config_value = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : "";
+            auto [ok, output, code] = pdbsql::handle_config_command(config_path, config_value);
+            printf("%s", output.c_str());
+            return code;
 #endif
         } else if (strcmp(argv[i], "--server") == 0) {
             server_mode = true;
