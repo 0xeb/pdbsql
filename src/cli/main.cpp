@@ -507,18 +507,9 @@ void interactive_mode(xsql::Database& db) {
 #ifdef PDBSQL_HAS_AI_AGENT
         // In agent mode, use AI for natural language or SQL passthrough
         if (agent_mode && agent) {
-            // Query with streaming (tools execute on main thread)
-            std::string result = agent->query_streaming(line, [verbose](const std::string& content) {
-                if (verbose) {
-                    printf("%s", content.c_str());
-                    fflush(stdout);
-                }
-            });
-
-            if (!result.empty() && !verbose) {
+            std::string result = agent->query(line);
+            if (!result.empty()) {
                 printf("%s\n", result.c_str());
-            } else if (verbose) {
-                printf("\n");  // Newline after streaming
             }
 
             // Check if we were interrupted
