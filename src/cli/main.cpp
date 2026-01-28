@@ -269,10 +269,14 @@ void print_usage(const char* prog) {
     printf("pdbsql - SQL interface to PDB files\n\n");
     printf("Usage:\n");
     printf("  %s <pdb_file>                       Dump symbol counts\n", prog);
-    printf("  %s <pdb_file> \"<query>\"             Execute SQL query (local)\n", prog);
+    printf("  %s -s <pdb_file> \"<query>\"          Execute SQL query (local)\n", prog);
     printf("  %s <pdb_file> -q \"<query>\"          Execute SQL query (local)\n", prog);
     printf("  %s <pdb_file> -i                    Interactive mode (local)\n", prog);
     printf("  %s <pdb_file> --server [port]       Start server (default: 13337)\n", prog);
+    printf("\nOptions:\n");
+    printf("  -s, --source <path>    PDB file path (alternative to positional)\n");
+    printf("  -q <query>             SQL query to execute\n");
+    printf("  -i, --interactive      Interactive SQL mode\n");
     printf("  %s --remote host:port -q \"<query>\"  Execute SQL query (remote)\n", prog);
     printf("  %s --remote host:port -i            Interactive mode (remote)\n", prog);
     printf("  %s --token <token>                  Auth token for server/remote mode\n", prog);
@@ -952,6 +956,8 @@ int main(int argc, char* argv[]) {
             }
         } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_addr = argv[++i];
+        } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--source") == 0) && i + 1 < argc) {
+            pdb_path = argv[++i];
         } else if (pdb_path.empty() && argv[i][0] != '-') {
             pdb_path = argv[i];
         } else if (query.empty() && argv[i][0] != '-') {
