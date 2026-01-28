@@ -406,10 +406,10 @@ void interactive_mode(xsql::Database& db) {
 
         printf("PDBSQL AI Agent Mode\n");
         printf("Ask questions in natural language or use SQL directly.\n");
-        printf("Type .help for commands, .quit to exit, Ctrl-C to interrupt\n\n");
+        printf("Type .help for commands, .clear to reset, .quit to exit\n\n");
     } else {
 #endif
-        printf("PDBSQL Interactive Mode. Type .quit to exit.\n\n");
+        printf("PDBSQL Interactive Mode. Type .help, .clear, .quit\n\n");
 #ifdef PDBSQL_HAS_AI_AGENT
     }
 #endif
