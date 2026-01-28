@@ -33,3 +33,9 @@ if(PDBSQL_WITH_AI_AGENT)
     target_compile_definitions(pdbsql PRIVATE PDBSQL_HAS_AI_AGENT)
     message(STATUS "pdbsql CLI: AI agent support enabled")
 endif()
+
+# HTTP server support
+if(PDBSQL_WITH_HTTP)
+    target_compile_definitions(pdbsql PRIVATE PDBSQL_HAS_HTTP)
+    message(STATUS "pdbsql CLI: HTTP server support enabled")
+endif()

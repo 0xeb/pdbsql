@@ -27,9 +27,14 @@
 #include <atomic>
 #include <sstream>
 #include <mutex>
+#include <thread>
+#include <chrono>
 
 // Socket client for remote mode (no DIA dependency)
 #include <xsql/socket/client.hpp>
+#ifdef PDBSQL_HAS_HTTP
+#include <xsql/thinclient/server.hpp>
+#endif
 
 // AI Agent integration (optional, enabled via PDBSQL_WITH_AI_AGENT)
 #ifdef PDBSQL_HAS_AI_AGENT
@@ -271,6 +276,10 @@ void print_usage(const char* prog) {
     printf("  %s --remote host:port -q \"<query>\"  Execute SQL query (remote)\n", prog);
     printf("  %s --remote host:port -i            Interactive mode (remote)\n", prog);
     printf("  %s --token <token>                  Auth token for server/remote mode\n", prog);
+#ifdef PDBSQL_HAS_HTTP
+    printf("  %s <pdb_file> --http [port]          Start HTTP REST server (default: 8080)\n", prog);
+    printf("  %s <pdb_file> --bind <addr>          Bind address for HTTP (default: 127.0.0.1)\n", prog);
+#endif
 #ifdef PDBSQL_HAS_AI_AGENT
     printf("  %s <pdb_file> --prompt \"<text>\"     Natural language query (AI agent)\n", prog);
     printf("  %s <pdb_file> -i --agent            Interactive mode with AI agent\n", prog);
@@ -597,6 +606,274 @@ int run_server_mode(const std::string& pdb_path, int port, const std::string& au
 }
 
 //=============================================================================
+// HTTP Server Mode
+//=============================================================================
+
+#ifdef PDBSQL_HAS_HTTP
+static xsql::thinclient::server* g_http_server = nullptr;
+
+static void http_signal_handler(int) {
+    if (g_http_server) g_http_server->stop();
+}
+
+static std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 10);
+    for (char ch : s) {
+        switch (ch) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
+                    out += buf;
+                } else {
+                    out += ch;
+                }
+        }
+    }
+    return out;
+}
+
+static std::string query_result_to_json(xsql::Database& db, const std::string& sql) {
+    auto result = db.query(sql);
+    std::ostringstream json;
+    json << "{";
+    json << "\"success\":" << (result.ok() ? "true" : "false");
+
+    if (result.ok()) {
+        json << ",\"columns\":[";
+        for (size_t i = 0; i < result.columns.size(); i++) {
+            if (i > 0) json << ",";
+            json << "\"" << json_escape(result.columns[i]) << "\"";
+        }
+        json << "]";
+
+        json << ",\"rows\":[";
+        for (size_t i = 0; i < result.rows.size(); i++) {
+            if (i > 0) json << ",";
+            json << "[";
+            for (size_t c = 0; c < result.rows[i].size(); c++) {
+                if (c > 0) json << ",";
+                json << "\"" << json_escape(result.rows[i][c]) << "\"";
+            }
+            json << "]";
+        }
+        json << "]";
+        json << ",\"row_count\":" << result.rows.size();
+    } else {
+        json << ",\"error\":\"" << json_escape(result.error) << "\"";
+    }
+
+    json << "}";
+    return json.str();
+}
+
+static const char* PDBSQL_HELP_TEXT = R"(PDBSQL HTTP REST API
+====================
+
+SQL interface for Windows PDB debug symbols via HTTP.
+
+Endpoints:
+  GET  /         - Welcome message
+  GET  /help     - This documentation (for LLM discovery)
+  POST /query    - Execute SQL (body = raw SQL, response = JSON)
+  GET  /status   - Server health
+  GET  /health   - Alias for /status
+  POST /shutdown - Stop server
+
+Tables:
+  functions       - Functions with RVA, size, section info
+  publics         - Public symbols
+  data            - Data symbols (global/static variables)
+  udts            - User-defined types (classes, structs, unions)
+  enums           - Enumerations
+  typedefs        - Type definitions
+  thunks          - Thunk symbols
+  labels          - Labels
+  compilands      - Compilation units
+  source_files    - Source file paths
+  line_numbers    - Line number mappings
+  sections        - PE sections
+  udt_members     - UDT member fields
+  enum_values     - Enumeration values
+  base_classes    - Class inheritance
+  locals          - Local variables
+  parameters      - Function parameters
+
+Example Queries:
+  SELECT name, rva, size FROM functions ORDER BY size DESC LIMIT 10;
+  SELECT name FROM udts WHERE kind = 'class';
+  SELECT * FROM sections;
+
+Response Format:
+  Success: {"success": true, "columns": [...], "rows": [[...]], "row_count": N}
+  Error:   {"success": false, "error": "message"}
+
+Example:
+  curl http://localhost:8080/help
+  curl -X POST http://localhost:8080/query -d "SELECT name FROM functions LIMIT 5"
+)";
+
+int run_http_mode(const std::string& pdb_path, int port, const std::string& bind_addr, const std::string& auth_token) {
+    // Open PDB
+    pdbsql::PdbSession session;
+    if (!session.open(pdb_path)) {
+        fprintf(stderr, "Error: %s\n", session.last_error().c_str());
+        return 1;
+    }
+
+    printf("PDBSQL HTTP Server - Loaded: %s\n", pdb_path.c_str());
+
+    // Create database and register tables
+    xsql::Database db;
+    pdbsql::TableRegistry registry(session);
+    registry.register_all(db);
+
+    xsql::thinclient::server_config cfg;
+    cfg.port = port;
+    cfg.bind_address = bind_addr.empty() ? "127.0.0.1" : bind_addr;
+    if (!auth_token.empty()) cfg.auth_token = auth_token;
+    if (!bind_addr.empty() && bind_addr != "127.0.0.1" && bind_addr != "localhost") {
+        cfg.allow_insecure_no_auth = auth_token.empty();
+    }
+
+    std::mutex query_mutex;
+
+    cfg.setup_routes = [&db, &pdb_path, &auth_token, &query_mutex, port](httplib::Server& svr) {
+        svr.Get("/", [port](const httplib::Request&, httplib::Response& res) {
+            std::string welcome = "PDBSQL HTTP Server\n\nEndpoints:\n"
+                "  GET  /help     - API documentation\n"
+                "  POST /query    - Execute SQL query\n"
+                "  GET  /status   - Health check\n"
+                "  POST /shutdown - Stop server\n\n"
+                "Example: curl -X POST http://localhost:" + std::to_string(port) + "/query -d \"SELECT name FROM functions LIMIT 5\"\n";
+            res.set_content(welcome, "text/plain");
+        });
+
+        svr.Get("/help", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(PDBSQL_HELP_TEXT, "text/plain");
+        });
+
+        svr.Post("/query", [&db, &auth_token, &query_mutex](const httplib::Request& req, httplib::Response& res) {
+            if (!auth_token.empty()) {
+                std::string token;
+                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
+                else if (req.has_header("Authorization")) {
+                    auto auth = req.get_header_value("Authorization");
+                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
+                }
+                if (token != auth_token) {
+                    res.status = 401;
+                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
+                    return;
+                }
+            }
+            if (req.body.empty()) {
+                res.status = 400;
+                res.set_content("{\"success\":false,\"error\":\"Empty query\"}", "application/json");
+                return;
+            }
+            std::lock_guard<std::mutex> lock(query_mutex);
+            res.set_content(query_result_to_json(db, req.body), "application/json");
+        });
+
+        svr.Get("/status", [&db, &pdb_path, &auth_token](const httplib::Request& req, httplib::Response& res) {
+            if (!auth_token.empty()) {
+                std::string token;
+                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
+                else if (req.has_header("Authorization")) {
+                    auto auth = req.get_header_value("Authorization");
+                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
+                }
+                if (token != auth_token) {
+                    res.status = 401;
+                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
+                    return;
+                }
+            }
+            auto result = db.query("SELECT COUNT(*) FROM functions");
+            std::string count = result.ok() && !result.empty() ? result[0][0] : "?";
+            res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"pdbsql\",\"pdb\":\"" + json_escape(pdb_path) + "\",\"functions\":" + count + "}", "application/json");
+        });
+
+        // GET /health - Alias for /status
+        svr.Get("/health", [&db, &pdb_path, &auth_token](const httplib::Request& req, httplib::Response& res) {
+            if (!auth_token.empty()) {
+                std::string token;
+                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
+                else if (req.has_header("Authorization")) {
+                    auto auth = req.get_header_value("Authorization");
+                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
+                }
+                if (token != auth_token) {
+                    res.status = 401;
+                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
+                    return;
+                }
+            }
+            auto result = db.query("SELECT COUNT(*) FROM functions");
+            std::string count = result.ok() && !result.empty() ? result[0][0] : "?";
+            res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"pdbsql\",\"pdb\":\"" + json_escape(pdb_path) + "\",\"functions\":" + count + "}", "application/json");
+        });
+
+        svr.Post("/shutdown", [&svr, &auth_token](const httplib::Request& req, httplib::Response& res) {
+            if (!auth_token.empty()) {
+                std::string token;
+                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
+                else if (req.has_header("Authorization")) {
+                    auto auth = req.get_header_value("Authorization");
+                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
+                }
+                if (token != auth_token) {
+                    res.status = 401;
+                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
+                    return;
+                }
+            }
+            res.set_content("{\"success\":true,\"message\":\"Shutting down\"}", "application/json");
+            std::thread([&svr] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                svr.stop();
+            }).detach();
+        });
+    };
+
+    xsql::thinclient::server http_server(cfg);
+    g_http_server = &http_server;
+
+    auto old_handler = std::signal(SIGINT, http_signal_handler);
+#ifdef _WIN32
+    auto old_break_handler = std::signal(SIGBREAK, http_signal_handler);
+#else
+    auto old_term_handler = std::signal(SIGTERM, http_signal_handler);
+#endif
+
+    printf("HTTP server listening on http://%s:%d\n", cfg.bind_address.c_str(), port);
+    printf("Endpoints: /help, /query, /status, /shutdown\n");
+    printf("Example: curl http://localhost:%d/help\n", port);
+    printf("Press Ctrl+C to stop.\n\n");
+    fflush(stdout);
+
+    http_server.run();
+
+    std::signal(SIGINT, old_handler);
+#ifdef _WIN32
+    std::signal(SIGBREAK, old_break_handler);
+#else
+    std::signal(SIGTERM, old_term_handler);
+#endif
+    g_http_server = nullptr;
+    printf("\nHTTP server stopped.\n");
+    return 0;
+}
+#endif // PDBSQL_HAS_HTTP
+
+//=============================================================================
 // Main
 //=============================================================================
 
@@ -605,9 +882,12 @@ int main(int argc, char* argv[]) {
     std::string query;
     std::string remote_spec;
     std::string auth_token;
+    std::string bind_addr;
     bool interactive = false;
     bool server_mode = false;
+    bool http_mode = false;
     int server_port = 13337;
+    int http_port = 8080;
 #ifdef PDBSQL_HAS_AI_AGENT
     std::string nl_prompt;            // --prompt for natural language
     bool agent_mode = false;          // --agent for interactive mode
@@ -661,6 +941,17 @@ int main(int argc, char* argv[]) {
             remote_spec = argv[++i];
         } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
             auth_token = argv[++i];
+        } else if (strcmp(argv[i], "--http") == 0) {
+            http_mode = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::string port_str = argv[++i];
+                if (!parse_port(port_str, http_port)) {
+                    fprintf(stderr, "Invalid HTTP port: %s\n", port_str.c_str());
+                    return 1;
+                }
+            }
+        } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
+            bind_addr = argv[++i];
         } else if (pdb_path.empty() && argv[i][0] != '-') {
             pdb_path = argv[i];
         } else if (query.empty() && argv[i][0] != '-') {
@@ -681,8 +972,8 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Error: Cannot use both PDB path and --remote\n");
             return 1;
         }
-        if (server_mode) {
-            fprintf(stderr, "Error: Cannot use both --server and --remote\n");
+        if (server_mode || http_mode) {
+            fprintf(stderr, "Error: Cannot use both --server/--http and --remote\n");
             return 1;
         }
 
@@ -719,6 +1010,20 @@ int main(int argc, char* argv[]) {
     if (server_mode) {
         return run_server_mode(pdb_path, server_port, auth_token);
     }
+
+    //=========================================================================
+    // HTTP server mode
+    //=========================================================================
+#ifdef PDBSQL_HAS_HTTP
+    if (http_mode) {
+        return run_http_mode(pdb_path, http_port, bind_addr, auth_token);
+    }
+#else
+    if (http_mode) {
+        fprintf(stderr, "Error: HTTP mode not available. Rebuild with -DPDBSQL_WITH_HTTP=ON\n");
+        return 1;
+    }
+#endif
 
     //=========================================================================
     // Local query/interactive mode

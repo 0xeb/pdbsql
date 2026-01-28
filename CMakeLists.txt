@@ -11,6 +11,13 @@ endif()
 
 # AI Agent support (optional)
 option(PDBSQL_WITH_AI_AGENT "Enable AI agent support via libagents" ON)
+option(PDBSQL_WITH_HTTP "Build with HTTP REST server support" OFF)
+
+# HTTP support requires thinclient from libxsql
+if(PDBSQL_WITH_HTTP)
+    message(STATUS "pdbsql: Building with HTTP server support")
+    set(XSQL_WITH_THINCLIENT ON CACHE BOOL "" FORCE)
+endif()
 
 # Output directories (only set if building standalone)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
