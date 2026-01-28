@@ -1,5 +1,5 @@
 // Auto-generated from pdbsql_agent.md
-// Generated: 2026-01-24T17:57:30.400005
+// Generated: 2026-01-28T09:14:19.220407
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -748,6 +748,87 @@ AND NOT EXISTS (
   SELECT 1 FROM parameters WHERE type_name LIKE '%' || u.name || '%'
 )
 ORDER BY u.name;
+```
+
+---
+
+## Server Modes
+
+PDBSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
+
+---
+
+### HTTP REST Server (Recommended)
+
+Standard REST API that works with curl, any HTTP client, or LLM tools.
+
+**Starting the server:**
+```bash
+# Default port 8081
+pdbsql database.pdb --http
+
+# Custom port and bind address
+pdbsql database.pdb --http 9000 --bind 0.0.0.0
+
+# With authentication
+pdbsql database.pdb --http 8081 --token mysecret
+```
+
+**HTTP Endpoints:**
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/` | GET | No | Welcome message |
+| `/help` | GET | No | API documentation (for LLM discovery) |
+| `/query` | POST | Yes* | Execute SQL (body = raw SQL) |
+| `/status` | GET | Yes* | Health check |
+| `/health` | GET | Yes* | Alias for /status |
+| `/shutdown` | POST | Yes* | Stop server |
+
+*Auth required only if `--token` was specified.
+
+**Example with curl:**
+```bash
+# Get API documentation
+curl http://localhost:8081/help
+
+# Execute SQL query
+curl -X POST http://localhost:8081/query -d "SELECT name, rva FROM functions LIMIT 5"
+
+# With authentication
+curl -X POST http://localhost:8081/query \
+     -H "Authorization: Bearer mysecret" \
+     -d "SELECT * FROM udts"
+
+# Check status
+curl http://localhost:8081/status
+```
+
+**Response Format (JSON):**
+```json
+{"success": true, "columns": ["name", "rva"], "rows": [["main", "4096"]], "row_count": 1}
+```
+
+```json
+{"success": false, "error": "no such table: bad_table"}
+```
+
+---
+
+### Raw TCP Server (Legacy)
+
+Binary protocol with length-prefixed JSON. Use only when HTTP is not available.
+
+**Starting the server:**
+```bash
+pdbsql database.pdb --server 13337
+pdbsql database.pdb --server 13337 --token mysecret
+```
+
+**Connecting as client:**
+```bash
+pdbsql --remote localhost:13337 -q "SELECT name FROM functions LIMIT 5"
+pdbsql --remote localhost:13337 -i
 ```
 )PROMPT";
 
