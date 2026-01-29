@@ -112,6 +112,17 @@ pdbsql> which source files have the most functions?
 
 The agent translates your questions to SQL, runs the query, and explains results. SQL passthrough still works - if you type `SELECT ...`, it executes directly.
 
+### Prerequisites for AI Features
+
+The AI agent requires one of these CLI tools installed and authenticated:
+
+| Provider | CLI Tool | Install | Login |
+|----------|----------|---------|-------|
+| Claude (default) | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm install -g @anthropic-ai/claude-code` | Run `claude`, then `/login` |
+| GitHub Copilot | [Copilot CLI](https://github.com/features/copilot/cli/) | `npm install -g @github/copilot` | Run `copilot`, then `/login` |
+
+**Important:** You must be logged in before using AI features.
+
 ### Agent Setup
 
 The agent uses [libagents](https://github.com/0xeb/libagents) to connect to LLM providers. Configure once:
