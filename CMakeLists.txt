@@ -11,7 +11,7 @@ endif()
 
 # AI Agent support (optional)
 option(PDBSQL_WITH_AI_AGENT "Enable AI agent support via libagents" ON)
-option(PDBSQL_WITH_HTTP "Build with HTTP REST server support" OFF)
+option(PDBSQL_WITH_HTTP "Build with HTTP REST server support" ON)
 
 # HTTP support requires thinclient from libxsql
 if(PDBSQL_WITH_HTTP)
