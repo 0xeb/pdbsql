@@ -29,6 +29,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
       - name: Configure
         shell: bash
         run: cmake -B build -A x64
@@ -41,8 +46,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp build/bin/Release/pdbsql.exe dist/ 2>/dev/null || cp build/Release/pdbsql.exe dist/ 2>/dev/null || true
-          cp build/bin/Release/*.dll dist/ 2>/dev/null || true
+          # Find pdbsql.exe (MSVC may put it in bin/Release or Release)
+          found=$(find build -name 'pdbsql.exe' -type f | head -1)
+          if [ -z "$found" ]; then
+            echo "ERROR: pdbsql.exe not found in build output"
+            find build -name '*.exe' -type f
+            exit 1
+          fi
+          cp "$found" dist/
+          # Copy any DLLs from the same directory
+          cp "$(dirname "$found")"/*.dll dist/ 2>/dev/null || true
+          echo "=== Package contents ==="
           ls -la dist/
 
       - name: Upload artifact
@@ -50,10 +64,10 @@ jobs:
         with:
           name: pdbsql-windows-x64
           path: dist/
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # ============================================================================
-  # Release
+  # Release (on tags only)
   # ============================================================================
   publish-release:
     name: Publish Release
