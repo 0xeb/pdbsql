@@ -55,6 +55,7 @@ set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib/amd64")
 # ============================================================================
 # libxsql dependency
 # ============================================================================
+find_package(Threads REQUIRED)
 
 if(TARGET xsql::xsql)
     # Part of monorepo - already available via add_subdirectory
@@ -103,11 +104,12 @@ if(PDBSQL_WITH_AI_AGENT)
     endif()
 
     # Embed the system prompt
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
     set(PROMPT_MD "${CMAKE_CURRENT_SOURCE_DIR}/prompts/pdbsql_agent.md")
     set(PROMPT_HPP "${CMAKE_CURRENT_SOURCE_DIR}/src/common/pdbsql_agent_prompt.hpp")
     add_custom_command(
         OUTPUT ${PROMPT_HPP}
-        COMMAND ${CMAKE_COMMAND} -E env python3 "${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_prompt.py"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_prompt.py"
                 "${PROMPT_MD}" "${PROMPT_HPP}"
         DEPENDS ${PROMPT_MD}
         COMMENT "Embedding pdbsql_agent.md into pdbsql_agent_prompt.hpp"
