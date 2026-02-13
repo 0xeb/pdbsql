@@ -10,7 +10,6 @@
 #include <utility>
 #include <vector>
 
-#include <sqlite3.h>
 #include <xsql/database.hpp>
 #include <xsql/socket/server.hpp>
 
