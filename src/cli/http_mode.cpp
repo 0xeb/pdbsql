@@ -31,7 +31,6 @@ Endpoints:
   GET  /help     - This documentation (for LLM discovery)
   POST /query    - Execute SQL (body = raw SQL, response = JSON)
   GET  /status   - Server health
-  GET  /health   - Alias for /status
   POST /shutdown - Stop server
 
 Tables:
@@ -158,25 +157,6 @@ int run_http_mode(const std::string& pdb_path, int port, const std::string& bind
             res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"pdbsql\",\"pdb\":\"" + json_escape(pdb_path) + "\",\"functions\":" + count + "}", "application/json");
         });
 
-        svr.Get("/health", [&db, &pdb_path, &auth_token](const httplib::Request& req, httplib::Response& res) {
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
-                else if (req.has_header("Authorization")) {
-                    auto auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-            auto result = db.query("SELECT COUNT(*) FROM functions");
-            std::string count = result.ok() && !result.empty() ? result[0][0] : "?";
-            res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"pdbsql\",\"pdb\":\"" + json_escape(pdb_path) + "\",\"functions\":" + count + "}", "application/json");
-        });
-
         svr.Post("/shutdown", [&svr, &auth_token](const httplib::Request& req, httplib::Response& res) {
             if (!auth_token.empty()) {
                 std::string token;
@@ -209,13 +189,19 @@ int run_http_mode(const std::string& pdb_path, int port, const std::string& bind
     auto old_term_handler = std::signal(SIGTERM, http_signal_handler);
 #endif
 
-    printf("HTTP server listening on http://%s:%d\n", cfg.bind_address.c_str(), port);
+    http_server.run_async();
+    int actual_port = http_server.port();
+
+    printf("HTTP server listening on http://%s:%d\n", cfg.bind_address.c_str(), actual_port);
     printf("Endpoints: /help, /query, /status, /shutdown\n");
-    printf("Example: curl http://localhost:%d/help\n", port);
+    printf("Example: curl http://localhost:%d/help\n", actual_port);
     printf("Press Ctrl+C to stop.\n\n");
     fflush(stdout);
 
-    http_server.run();
+    // Block until server stops (via signal or /shutdown)
+    while (http_server.is_running()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     std::signal(SIGINT, old_handler);
 #ifdef _WIN32
