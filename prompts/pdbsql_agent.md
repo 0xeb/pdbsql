@@ -773,7 +773,6 @@ pdbsql database.pdb --http 8081 --token mysecret
 | `/help` | GET | No | API documentation (for LLM discovery) |
 | `/query` | POST | Yes* | Execute SQL (body = raw SQL) |
 | `/status` | GET | Yes* | Health check |
-| `/health` | GET | Yes* | Alias for /status |
 | `/shutdown` | POST | Yes* | Stop server |
 
 *Auth required only if `--token` was specified.
