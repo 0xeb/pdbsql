@@ -935,14 +935,14 @@ public:
 
     bool eof() const override { return eof_; }
 
-    void column(sqlite3_context* ctx, int col) override {
-        if (!ctx || eof_ || !def_) {
-            sqlite3_result_null(ctx);
+    void column(xsql::FunctionContext& ctx, int col) override {
+        if (eof_ || !def_) {
+            ctx.result_null();
             return;
         }
 
         if (col < 0 || static_cast<size_t>(col) >= def_->columns.size()) {
-            sqlite3_result_null(ctx);
+            ctx.result_null();
             return;
         }
 
@@ -966,8 +966,8 @@ inline void add_filter_eq(GeneratorTableDef<RowData>& def,
     int filter_id = static_cast<int>(def.filters.size()) + 1;
     def.filters.emplace_back(
         col_idx, filter_id, cost, est_rows,
-        [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<xsql::RowIterator> {
-            return factory(sqlite3_value_int64(val));
+        [factory = std::move(factory)](xsql::FunctionArg val) -> std::unique_ptr<xsql::RowIterator> {
+            return factory(val.as_int64());
         });
 }
 
@@ -982,8 +982,8 @@ inline void add_filter_eq_text(GeneratorTableDef<RowData>& def,
     int filter_id = static_cast<int>(def.filters.size()) + 1;
     def.filters.emplace_back(
         col_idx, filter_id, cost, est_rows,
-        [factory = std::move(factory)](sqlite3_value* val) -> std::unique_ptr<xsql::RowIterator> {
-            const char* text = reinterpret_cast<const char*>(sqlite3_value_text(val));
+        [factory = std::move(factory)](xsql::FunctionArg val) -> std::unique_ptr<xsql::RowIterator> {
+            const char* text = val.as_c_str();
             return factory(text ? text : "");
         });
 }

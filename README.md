@@ -81,13 +81,13 @@ pdbsql> .schema functions
 pdbsql> .quit
 ```
 
-**Server mode** (expose PDB over network):
+**HTTP server mode** (expose PDB over HTTP):
 ```bash
 # Terminal 1: Start server
-pdbsql test.pdb --server 13337 --token secret123
+pdbsql test.pdb --http 8081 --token secret123
 
-# Terminal 2: Query remotely
-pdbsql --remote localhost:13337 --token secret123 -q "SELECT * FROM sections"
+# Terminal 2: Query over HTTP
+curl -X POST http://localhost:8081/query -H "Authorization: Bearer secret123" -d "SELECT * FROM sections"
 ```
 
 ## AI Agent Mode

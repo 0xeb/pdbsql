@@ -2,7 +2,6 @@
 
 set(PDBSQL_SOURCES
     main.cpp
-    remote_mode.cpp
 )
 
 # AI agent support

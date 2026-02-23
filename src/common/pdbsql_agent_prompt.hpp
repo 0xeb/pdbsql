@@ -1,5 +1,5 @@
 // Auto-generated from pdbsql_agent.md
-// Generated: 2026-01-28T09:14:19.220407
+// Generated: 2026-02-19T06:03:27.159208
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -812,23 +812,6 @@ curl http://localhost:8081/status
 {"success": false, "error": "no such table: bad_table"}
 ```
 
----
-
-### Raw TCP Server (Legacy)
-
-Binary protocol with length-prefixed JSON. Use only when HTTP is not available.
-
-**Starting the server:**
-```bash
-pdbsql database.pdb --server 13337
-pdbsql database.pdb --server 13337 --token mysecret
-```
-
-**Connecting as client:**
-```bash
-pdbsql --remote localhost:13337 -q "SELECT name FROM functions LIMIT 5"
-pdbsql --remote localhost:13337 -i
-```
 )PROMPT";
 
 } // namespace pdbsql

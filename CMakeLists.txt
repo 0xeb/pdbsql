@@ -58,7 +58,7 @@ set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib/amd64")
 find_package(Threads REQUIRED)
 
 if(TARGET xsql::xsql)
-    # Part of monorepo - already available via add_subdirectory
+    # Parent project: already available via add_subdirectory
     message(STATUS "pdbsql: Using xsql::xsql from parent project")
 else()
     # Standalone build - try find_package first, then fallback to sibling directory
@@ -66,7 +66,7 @@ else()
     if(xsql_FOUND)
         message(STATUS "pdbsql: Using xsql::xsql via find_package")
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libxsql/CMakeLists.txt")
-        # Monorepo: sibling directory
+        # Parent project: sibling directory
         add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
         message(STATUS "pdbsql: Added libxsql from sibling directory")
     elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql/CMakeLists.txt")
@@ -75,7 +75,7 @@ else()
         message(STATUS "pdbsql: Added libxsql from external/libxsql submodule")
     else()
         message(FATAL_ERROR "libxsql not found. Either:\n"
-            "  1. Build as part of xsql monorepo\n"
+            "  1. Build from a parent project that already provides libxsql\n"
             "  2. Set xsql_DIR to the libxsql build directory\n"
             "  3. Install libxsql and ensure it's in CMAKE_PREFIX_PATH\n"
             "  4. Initialize submodule: git submodule update --init external/libxsql")
@@ -88,7 +88,7 @@ endif()
 
 if(PDBSQL_WITH_AI_AGENT)
     if(TARGET libagents::libagents)
-        # Part of monorepo - already available
+        # Parent project: already available
         message(STATUS "pdbsql: Using libagents::libagents from parent project")
     else()
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libagents/CMakeLists.txt")
@@ -98,7 +98,7 @@ if(PDBSQL_WITH_AI_AGENT)
             message(STATUS "pdbsql: Added libagents from external/libagents submodule")
         else()
             message(FATAL_ERROR "libagents not found. Either:\n"
-                "  1. Build as part of xsql monorepo\n"
+                "  1. Build from a parent project that already provides libagents\n"
                 "  2. Initialize submodule: git submodule update --init external/libagents")
         endif()
     endif()
@@ -127,4 +127,4 @@ link_directories(${DIA_LIB_DIR})
 # CLI tool
 add_subdirectory(src/cli)
 
-# Tests are in the private xsql monorepo (tests/pdbsql/)
+# Additional integration tests may be provided by parent projects.

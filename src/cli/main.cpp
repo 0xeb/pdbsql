@@ -6,14 +6,12 @@
  *   pdbsql <pdb_file> "<query>"            Execute SQL query (local)
  *   pdbsql <pdb_file> -q "<query>"         Execute SQL query (local)
  *   pdbsql <pdb_file> -i                   Interactive mode (local)
- *   pdbsql <pdb_file> --server [port]      Start server mode (default: 13337)
- *   pdbsql --remote host:port -q "<query>" Execute SQL query (remote)
- *   pdbsql --remote host:port -i           Interactive mode (remote)
+ *   pdbsql <pdb_file> --http [port]        Start HTTP server mode
+ *   pdbsql <pdb_file> --mcp [port]         Start MCP server mode
  */
 
 #include "table_printer.hpp"
 #include "query_json.hpp"
-#include "remote_mode.hpp"
 #ifdef PDBSQL_HAS_HTTP
 #include "http_mode.hpp"
 #endif
@@ -23,10 +21,8 @@
 
 #include "pdb_session.hpp"
 #include "pdb_tables.hpp"
-#include "server_query_dispatcher.hpp"
 
 #include <xsql/database.hpp>
-#include <xsql/socket/server.hpp>
 
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +38,11 @@
 #include <thread>
 #include <chrono>
 #include <memory>
+
+static bool parse_port(const std::string &s, int &port) {
+    try { port = std::stoi(s); return port > 0 && port <= 65535; }
+    catch (...) { return false; }
+}
 
 #ifdef PDBSQL_HAS_AI_AGENT
 #include "../common/ai_agent.hpp"
@@ -156,14 +157,11 @@ static void print_usage(const char* prog) {
     printf("  %s -s <pdb_file> \"<query>\"          Execute SQL query (local)\n", prog);
     printf("  %s <pdb_file> -q \"<query>\"          Execute SQL query (local)\n", prog);
     printf("  %s <pdb_file> -i                    Interactive mode (local)\n", prog);
-    printf("  %s <pdb_file> --server [port]       Start server (default: 13337)\n", prog);
     printf("\nOptions:\n");
     printf("  -s, --source <path>    PDB file path (alternative to positional)\n");
     printf("  -q <query>             SQL query to execute\n");
     printf("  -i, --interactive      Interactive SQL mode\n");
-    printf("  %s --remote host:port -q \"<query>\"  Execute SQL query (remote)\n", prog);
-    printf("  %s --remote host:port -i            Interactive mode (remote)\n", prog);
-    printf("  %s --token <token>                  Auth token for server/remote mode\n", prog);
+    printf("  %s --token <token>                  Auth token for HTTP/MCP mode\n", prog);
 #ifdef PDBSQL_HAS_HTTP
     printf("  %s <pdb_file> --http [port]          Start HTTP REST server (default: 8080)\n", prog);
     printf("  %s <pdb_file> --bind <addr>          Bind address for HTTP (default: 127.0.0.1)\n", prog);
@@ -186,8 +184,7 @@ static void print_usage(const char* prog) {
     printf("\nExamples:\n");
     printf("  %s test.pdb \"SELECT name, rva FROM functions LIMIT 10\"\n", prog);
     printf("  %s test.pdb \"SELECT * FROM udts WHERE name LIKE '%%Counter%%'\"\n", prog);
-    printf("  %s test.pdb --server 13337\n", prog);
-    printf("  %s --remote localhost:13337 -q \"SELECT * FROM functions\"\n", prog);
+    printf("  %s test.pdb --http 8080\n", prog);
 #ifdef PDBSQL_HAS_AI_AGENT
     printf("  %s test.pdb --prompt \"Find the largest functions\"\n", prog);
     printf("  %s test.pdb -i --agent\n", prog);
@@ -461,42 +458,6 @@ exit_interactive:
 #endif
 }
 
-//=============================================================================
-// Server Mode
-//=============================================================================
-
-static int run_server_mode(const std::string& pdb_path, int port, const std::string& auth_token) {
-    pdbsql::PdbSession session;
-    if (!session.open(pdb_path)) {
-        fprintf(stderr, "Error: %s\n", session.last_error().c_str());
-        return 1;
-    }
-
-    printf("PDBSQL Server - Loaded: %s\n", pdb_path.c_str());
-
-    xsql::Database db;
-    pdbsql::TableRegistry registry(session);
-    registry.register_all(db);
-
-    xsql::socket::Server server;
-    if (!auth_token.empty()) {
-        xsql::socket::ServerConfig cfg;
-        cfg.auth_token = auth_token;
-        server.set_config(cfg);
-    }
-    pdbsql::ServerQueryDispatcher dispatcher(db);
-    server.set_query_handler([&dispatcher](const std::string& sql) -> xsql::socket::QueryResult {
-        return dispatcher.run(sql);
-    });
-
-    printf("Starting server on port %d...\n", port);
-    printf("Connect with: pdbsql --remote localhost:%d -q \"SELECT * FROM functions\"\n", port);
-    printf("Press Ctrl+C to stop.\n\n");
-
-    server.run(port);
-    return 0;
-}
-
 static void dump_symbol_counts(pdbsql::PdbSession& session) {
     printf("Symbol Counts:\n");
     printf("  Functions:      %ld\n", session.count_symbols(SymTagFunction));
@@ -515,13 +476,10 @@ static void dump_symbol_counts(pdbsql::PdbSession& session) {
 int main(int argc, char* argv[]) {
     std::string pdb_path;
     std::string query;
-    std::string remote_spec;
     std::string auth_token;
     std::string bind_addr;
     bool interactive = false;
-    bool server_mode = false;
     bool http_mode = false;
-    int server_port = 13337;
     int http_port = 8080;
 #ifdef PDBSQL_HAS_AI_AGENT
     std::string nl_prompt;
@@ -571,17 +529,6 @@ int main(int argc, char* argv[]) {
             printf("%s", output.c_str());
             return code;
 #endif
-        } else if (strcmp(argv[i], "--server") == 0) {
-            server_mode = true;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                std::string port_str = argv[++i];
-                if (!parse_port(port_str, server_port)) {
-                    fprintf(stderr, "Invalid port: %s\n", port_str.c_str());
-                    return 1;
-                }
-            }
-        } else if (strcmp(argv[i], "--remote") == 0 && i + 1 < argc) {
-            remote_spec = argv[++i];
         } else if (strcmp(argv[i], "--token") == 0 && i + 1 < argc) {
             auth_token = argv[++i];
         } else if (strcmp(argv[i], "--http") == 0) {
@@ -609,46 +556,12 @@ int main(int argc, char* argv[]) {
     }
 
     //=========================================================================
-    // Remote mode
-    //=========================================================================
-    if (!remote_spec.empty()) {
-        if (!pdb_path.empty()) {
-            fprintf(stderr, "Error: Cannot use both PDB path and --remote\n");
-            return 1;
-        }
-        if (server_mode || http_mode) {
-            fprintf(stderr, "Error: Cannot use both --server/--http and --remote\n");
-            return 1;
-        }
-
-        std::string host = "127.0.0.1";
-        int port = 13337;
-        auto colon = remote_spec.find(':');
-        if (colon != std::string::npos) {
-            host = remote_spec.substr(0, colon);
-            std::string port_str = remote_spec.substr(colon + 1);
-            if (!parse_port(port_str, port)) {
-                fprintf(stderr, "Invalid port in --remote: %s\n", port_str.c_str());
-                return 1;
-            }
-        } else {
-            host = remote_spec;
-        }
-
-        return run_remote_mode(host, port, query, auth_token, interactive);
-    }
-
-    //=========================================================================
     // Local modes - require PDB path
     //=========================================================================
     if (pdb_path.empty()) {
-        fprintf(stderr, "Error: PDB path required (or use --remote)\n\n");
+        fprintf(stderr, "Error: PDB path required\n\n");
         print_usage(argv[0]);
         return 1;
-    }
-
-    if (server_mode) {
-        return run_server_mode(pdb_path, server_port, auth_token);
     }
 
 #ifdef PDBSQL_HAS_HTTP
