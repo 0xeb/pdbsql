@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pdbsql VERSION 0.1.0 LANGUAGES C CXX)
+project(pdbsql VERSION 0.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,7 +50,11 @@ message(STATUS "Found DIA SDK: ${DIA_SDK_DIR}")
 
 # DIA SDK include/lib
 set(DIA_INCLUDE_DIR "${DIA_SDK_DIR}/include")
-set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib/amd64")
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib/amd64")
+else()
+    set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib")
+endif()
 
 # ============================================================================
 # libxsql dependency
