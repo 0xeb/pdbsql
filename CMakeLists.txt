@@ -83,19 +83,19 @@ endif()
 
 if(PDBSQL_WITH_AI_AGENT)
     if(TARGET libagents::libagents)
-        # Parent project: already available
         message(STATUS "pdbsql: Using libagents::libagents from parent project")
     else()
-        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libagents/CMakeLists.txt")
-            # Standalone: submodule in external/
-            add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/libagents
-                             ${CMAKE_CURRENT_BINARY_DIR}/libagents)
-            message(STATUS "pdbsql: Added libagents from external/libagents submodule")
-        else()
-            message(FATAL_ERROR "libagents not found. Either:\n"
-                "  1. Build from a parent project that already provides libagents\n"
-                "  2. Initialize submodule: git submodule update --init external/libagents")
-        endif()
+        message(STATUS "pdbsql: Fetching libagents from GitHub...")
+        set(LIBAGENTS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(LIBAGENTS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(LIBAGENTS_BUILD_CLI OFF CACHE BOOL "" FORCE)
+        include(FetchContent)
+        FetchContent_Declare(libagents
+            GIT_REPOSITORY https://github.com/0xeb/libagents.git
+            GIT_TAG        main
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(libagents)
     endif()
 
     # Embed the system prompt
