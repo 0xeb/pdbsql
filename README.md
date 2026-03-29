@@ -235,7 +235,7 @@ When using AI agent mode, your prompts and query results are sent to the configu
 
 ## License
 
-MIT
+This project is licensed under the [Mozilla Public License 2.0](LICENSE).
 
 ## See Also
 
