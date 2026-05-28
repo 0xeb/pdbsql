@@ -40,6 +40,7 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <cstdint>
 
 namespace pdbsql {
 
@@ -231,7 +232,7 @@ class SymbolGenerator : public xsql::Generator<CachedSymbol> {
     enum SymTagEnum tag_;
     CComPtr<IDiaEnumSymbols> symbols_;
     CachedSymbol current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
 public:
@@ -256,14 +257,14 @@ public:
     }
 
     const CachedSymbol& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class CompilandGenerator : public xsql::Generator<CachedCompiland> {
     PdbSession& session_;
     CComPtr<IDiaEnumSymbols> compilands_;
     CachedCompiland current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
 public:
@@ -288,14 +289,14 @@ public:
     }
 
     const CachedCompiland& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class SourceFileGenerator : public xsql::Generator<CachedSourceFile> {
     PdbSession& session_;
     CComPtr<IDiaEnumSourceFiles> source_files_;
     CachedSourceFile current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
 public:
@@ -322,7 +323,7 @@ public:
     }
 
     const CachedSourceFile& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class LineNumberGenerator : public xsql::Generator<CachedLineNumber> {
@@ -337,7 +338,7 @@ class LineNumberGenerator : public xsql::Generator<CachedLineNumber> {
     CComPtr<IDiaEnumLineNumbers> lines_;
 
     CachedLineNumber current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     bool advance_compiland() {
@@ -427,14 +428,14 @@ public:
     }
 
     const CachedLineNumber& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class SectionGenerator : public xsql::Generator<CachedSection> {
     PdbSession& session_;
     std::vector<CachedSection> sections_;
     size_t idx_ = 0;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     void build() {
@@ -524,7 +525,7 @@ public:
     }
 
     const CachedSection& current() const override { return sections_[idx_ - 1]; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class MemberGenerator : public xsql::Generator<CachedMember> {
@@ -536,7 +537,7 @@ class MemberGenerator : public xsql::Generator<CachedMember> {
     CComPtr<IDiaEnumSymbols> members_;
 
     CachedMember current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     bool advance_udt() {
@@ -624,7 +625,7 @@ public:
     }
 
     const CachedMember& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class EnumValueGenerator : public xsql::Generator<CachedEnumValue> {
@@ -636,7 +637,7 @@ class EnumValueGenerator : public xsql::Generator<CachedEnumValue> {
     CComPtr<IDiaEnumSymbols> values_;
 
     CachedEnumValue current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     bool advance_enum() {
@@ -723,7 +724,7 @@ public:
     }
 
     const CachedEnumValue& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class BaseClassGenerator : public xsql::Generator<CachedBaseClass> {
@@ -735,7 +736,7 @@ class BaseClassGenerator : public xsql::Generator<CachedBaseClass> {
     CComPtr<IDiaEnumSymbols> bases_;
 
     CachedBaseClass current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     bool advance_udt() {
@@ -815,7 +816,7 @@ public:
     }
 
     const CachedBaseClass& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class LocalOrParamGenerator : public xsql::Generator<CachedLocal> {
@@ -829,7 +830,7 @@ class LocalOrParamGenerator : public xsql::Generator<CachedLocal> {
     CComPtr<IDiaEnumSymbols> data_syms_;
 
     CachedLocal current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     bool advance_func() {
@@ -915,7 +916,7 @@ public:
     }
 
     const CachedLocal& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 template<typename RowData>
@@ -1003,7 +1004,7 @@ class SymbolByNameGenerator : public xsql::Generator<CachedSymbol> {
     std::string name_;
     CComPtr<IDiaEnumSymbols> symbols_;
     CachedSymbol current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
 public:
@@ -1032,7 +1033,7 @@ public:
     }
 
     const CachedSymbol& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class SymbolByIdGenerator : public xsql::Generator<CachedSymbol> {
@@ -1042,7 +1043,7 @@ class SymbolByIdGenerator : public xsql::Generator<CachedSymbol> {
     std::function<bool(IDiaSymbol*)> accept_;
     CachedSymbol current_;
     bool emitted_ = false;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
 public:
     SymbolByIdGenerator(PdbSession& session,
@@ -1083,7 +1084,7 @@ public:
     }
 
     const CachedSymbol& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class CompilandByNameGenerator : public xsql::Generator<CachedCompiland> {
@@ -1091,7 +1092,7 @@ class CompilandByNameGenerator : public xsql::Generator<CachedCompiland> {
     std::string name_;
     CComPtr<IDiaEnumSymbols> compilands_;
     CachedCompiland current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
 public:
@@ -1119,7 +1120,7 @@ public:
     }
 
     const CachedCompiland& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class CompilandByIdGenerator : public xsql::Generator<CachedCompiland> {
@@ -1127,7 +1128,7 @@ class CompilandByIdGenerator : public xsql::Generator<CachedCompiland> {
     DWORD id_ = 0;
     CachedCompiland current_;
     bool emitted_ = false;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
 public:
     CompilandByIdGenerator(PdbSession& session, DWORD id)
@@ -1159,7 +1160,7 @@ public:
     }
 
     const CachedCompiland& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class SourceFileByIdGenerator : public xsql::Generator<CachedSourceFile> {
@@ -1167,7 +1168,7 @@ class SourceFileByIdGenerator : public xsql::Generator<CachedSourceFile> {
     DWORD file_id_ = 0;
     CachedSourceFile current_;
     bool emitted_ = false;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
 public:
     SourceFileByIdGenerator(PdbSession& session, DWORD file_id)
@@ -1193,7 +1194,7 @@ public:
     }
 
     const CachedSourceFile& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class UdtMembersByIdGenerator : public xsql::Generator<CachedMember> {
@@ -1204,7 +1205,7 @@ class UdtMembersByIdGenerator : public xsql::Generator<CachedMember> {
     std::string parent_name_;
     CComPtr<IDiaEnumSymbols> members_;
     CachedMember current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
 public:
     UdtMembersByIdGenerator(PdbSession& session, DWORD udt_id)
@@ -1275,7 +1276,7 @@ public:
     }
 
     const CachedMember& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
@@ -1289,7 +1290,7 @@ class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
     CComPtr<IDiaEnumSymbols> members_;
 
     CachedMember current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     bool advance_udt() {
@@ -1378,7 +1379,7 @@ public:
     }
 
     const CachedMember& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class EnumValuesByIdGenerator : public xsql::Generator<CachedEnumValue> {
@@ -1388,7 +1389,7 @@ class EnumValuesByIdGenerator : public xsql::Generator<CachedEnumValue> {
     std::string enum_name_;
     CComPtr<IDiaEnumSymbols> values_;
     CachedEnumValue current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
     static int64_t variant_to_int64(const VARIANT& v) {
         switch (v.vt) {
@@ -1455,7 +1456,7 @@ public:
     }
 
     const CachedEnumValue& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class EnumValuesByNameGenerator : public xsql::Generator<CachedEnumValue> {
@@ -1469,7 +1470,7 @@ class EnumValuesByNameGenerator : public xsql::Generator<CachedEnumValue> {
     CComPtr<IDiaEnumSymbols> values_;
 
     CachedEnumValue current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
     bool started_ = false;
 
     bool advance_enum() {
@@ -1557,7 +1558,7 @@ public:
     }
 
     const CachedEnumValue& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class BaseClassesByDerivedIdGenerator : public xsql::Generator<CachedBaseClass> {
@@ -1567,7 +1568,7 @@ class BaseClassesByDerivedIdGenerator : public xsql::Generator<CachedBaseClass> 
     std::string derived_name_;
     CComPtr<IDiaEnumSymbols> bases_;
     CachedBaseClass current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
 public:
     BaseClassesByDerivedIdGenerator(PdbSession& session, DWORD derived_id)
@@ -1628,7 +1629,7 @@ public:
     }
 
     const CachedBaseClass& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class LocalOrParamByFuncIdGenerator : public xsql::Generator<CachedLocal> {
@@ -1639,7 +1640,7 @@ class LocalOrParamByFuncIdGenerator : public xsql::Generator<CachedLocal> {
     std::string func_name_;
     CComPtr<IDiaEnumSymbols> data_syms_;
     CachedLocal current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
 public:
     LocalOrParamByFuncIdGenerator(PdbSession& session, DWORD func_id, DWORD want_kind)
@@ -1707,7 +1708,7 @@ public:
     }
 
     const CachedLocal& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 class LineNumbersByCompilandIdGenerator : public xsql::Generator<CachedLineNumber> {
@@ -1719,7 +1720,7 @@ class LineNumbersByCompilandIdGenerator : public xsql::Generator<CachedLineNumbe
     CComPtr<IDiaEnumSourceFiles> source_files_;
     CComPtr<IDiaEnumLineNumbers> lines_;
     CachedLineNumber current_;
-    sqlite3_int64 rowid_ = -1;
+    int64_t rowid_ = -1;
 
     bool advance_file() {
         if (!source_files_) return false;
@@ -1786,7 +1787,7 @@ public:
     }
 
     const CachedLineNumber& current() const override { return current_; }
-    sqlite3_int64 rowid() const override { return rowid_; }
+    int64_t rowid() const override { return rowid_; }
 };
 
 // ============================================================================

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <xsql/database.hpp>
+#include <xsql/query_script.hpp>
 #include <string>
 #include <sstream>
 #include <cstdio>
@@ -35,36 +36,10 @@ inline std::string json_escape(const std::string& s) {
     return out;
 }
 
-inline std::string query_result_to_json(xsql::Database& db, const std::string& sql) {
-    auto result = db.query(sql);
-    std::ostringstream json;
-    json << "{";
-    json << "\"success\":" << (result.ok() ? "true" : "false");
-
-    if (result.ok()) {
-        json << ",\"columns\":[";
-        for (size_t i = 0; i < result.columns.size(); i++) {
-            if (i > 0) json << ",";
-            json << "\"" << json_escape(result.columns[i]) << "\"";
-        }
-        json << "]";
-
-        json << ",\"rows\":[";
-        for (size_t i = 0; i < result.rows.size(); i++) {
-            if (i > 0) json << ",";
-            json << "[";
-            for (size_t c = 0; c < result.rows[i].size(); c++) {
-                if (c > 0) json << ",";
-                json << "\"" << json_escape(result.rows[i][c]) << "\"";
-            }
-            json << "]";
-        }
-        json << "]";
-        json << ",\"row_count\":" << result.rows.size();
-    } else {
-        json << ",\"error\":\"" << json_escape(result.error) << "\"";
-    }
-
-    json << "}";
-    return json.str();
+// Multi-statement aware: returns the canonical xsql script envelope.
+// Single statement is array-of-one — no legacy single-shape fallback.
+inline std::string query_result_to_json(xsql::Database& db, const std::string& sql,
+                                        const xsql::ScriptOptions& options = {}) {
+    auto script = xsql::run_database_script(db, sql, options);
+    return xsql::script_result_to_json(script, options.include_sql);
 }
