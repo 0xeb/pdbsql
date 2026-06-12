@@ -1,12 +1,5 @@
-// Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
-//
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 // Auto-generated from pdbsql_agent.md
-// Generated: 2026-02-19T06:03:27.159208
+// Generated: 2026-05-31T20:38:47.744305
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -61,7 +54,7 @@ Functions are code symbols with:
 ### Compilands
 **Compilands** represent object files (`.obj`) that were linked:
 - `name` - Object file name
-- `library_name` - Static library if applicable
+- `library` - Static library if applicable
 - `language` - Source language (C, C++, etc.)
 
 ### Source Files and Line Numbers
@@ -108,6 +101,7 @@ Public symbols (exports, etc.).
 | `name` | TEXT | Symbol name |
 | `undecorated` | TEXT | Undecorated name |
 | `rva` | INT | Relative virtual address |
+| `length` | INT | Symbol size in bytes |
 | `section` | INT | PE section number |
 | `offset` | INT | Section offset |
 
@@ -123,8 +117,8 @@ Global and static data symbols.
 |--------|------|-------------|
 | `id` | INT | Symbol ID |
 | `name` | TEXT | Data symbol name |
-| `undecorated` | TEXT | Undecorated name |
 | `rva` | INT | Relative virtual address |
+| `length` | INT | Data size in bytes |
 | `section` | INT | PE section number |
 | `offset` | INT | Section offset |
 
@@ -140,7 +134,6 @@ User-defined types (structs, classes, unions).
 |--------|------|-------------|
 | `id` | INT | Type ID |
 | `name` | TEXT | Type name |
-| `undecorated` | TEXT | Undecorated name |
 | `length` | INT | Size in bytes |
 
 ```sql
@@ -158,7 +151,6 @@ Enumeration types.
 |--------|------|-------------|
 | `id` | INT | Enum type ID |
 | `name` | TEXT | Enum name |
-| `undecorated` | TEXT | Undecorated name |
 | `length` | INT | Underlying type size |
 
 ```sql
@@ -173,7 +165,7 @@ Type aliases.
 |--------|------|-------------|
 | `id` | INT | Typedef ID |
 | `name` | TEXT | Typedef name |
-| `undecorated` | TEXT | Undecorated name |
+| `length` | INT | Underlying type size |
 
 #### thunks
 Thunk symbols (import stubs, virtual function thunks).
@@ -182,10 +174,9 @@ Thunk symbols (import stubs, virtual function thunks).
 |--------|------|-------------|
 | `id` | INT | Thunk ID |
 | `name` | TEXT | Thunk name |
-| `undecorated` | TEXT | Undecorated name |
 | `rva` | INT | Relative virtual address |
+| `length` | INT | Thunk size in bytes |
 | `section` | INT | PE section number |
-| `offset` | INT | Section offset |
 
 #### labels
 Code labels (not functions).
@@ -194,7 +185,6 @@ Code labels (not functions).
 |--------|------|-------------|
 | `id` | INT | Label ID |
 | `name` | TEXT | Label name |
-| `undecorated` | TEXT | Undecorated name |
 | `rva` | INT | Relative virtual address |
 | `section` | INT | PE section number |
 | `offset` | INT | Section offset |
@@ -206,23 +196,26 @@ Members of structs/classes/unions.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `parent_id` | INT | Parent UDT ID |
-| `parent_name` | TEXT | Parent UDT name |
+| `udt_id` | INT | Parent UDT ID |
+| `udt_name` | TEXT | Parent UDT name |
 | `id` | INT | Member ID |
 | `name` | TEXT | Member name |
+| `type` | TEXT | Member type |
 | `offset` | INT | Offset within parent |
 | `length` | INT | Member size |
-| `type_name` | TEXT | Member type |
+| `access` | INT | Access modifier (DIA enum: 1=private, 2=protected, 3=public) |
+| `is_static` | INT | 1 if static member |
+| `is_virtual` | INT | 1 if virtual member |
 
 ```sql
 -- Members of a specific struct
-SELECT name, offset, length, type_name
+SELECT name, offset, length, type
 FROM udt_members
-WHERE parent_name = 'MyStruct'
+WHERE udt_name = 'MyStruct'
 ORDER BY offset;
 
 -- Find all pointer members
-SELECT parent_name, name FROM udt_members WHERE type_name LIKE '%*%';
+SELECT udt_name, name FROM udt_members WHERE type LIKE '%*%';
 ```
 
 #### enum_values
@@ -230,14 +223,15 @@ Enumeration constant values.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `parent_id` | INT | Parent enum ID |
-| `parent_name` | TEXT | Parent enum name |
+| `enum_id` | INT | Parent enum ID |
+| `enum_name` | TEXT | Parent enum name |
+| `id` | INT | Value entry ID |
 | `name` | TEXT | Constant name |
 | `value` | INT | Constant value |
 
 ```sql
 -- Values in an enum
-SELECT name, value FROM enum_values WHERE parent_name = 'ErrorCode' ORDER BY value;
+SELECT name, value FROM enum_values WHERE enum_name = 'ErrorCode' ORDER BY value;
 ```
 
 #### base_classes
@@ -245,24 +239,25 @@ Base class relationships (C++ inheritance).
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `parent_id` | INT | Derived class ID |
-| `parent_name` | TEXT | Derived class name |
+| `derived_id` | INT | Derived class ID |
+| `derived_name` | TEXT | Derived class name |
 | `base_id` | INT | Base class ID |
 | `base_name` | TEXT | Base class name |
 | `offset` | INT | Base class offset |
 | `is_virtual` | INT | 1 if virtual inheritance |
+| `access` | INT | Access modifier (DIA enum: 1=private, 2=protected, 3=public) |
 
 ```sql
 -- Find all derived classes of a base
-SELECT parent_name FROM base_classes WHERE base_name = 'IUnknown';
+SELECT derived_name FROM base_classes WHERE base_name = 'IUnknown';
 
 -- Inheritance hierarchy
 WITH RECURSIVE hierarchy AS (
-  SELECT parent_name, base_name, 0 as depth FROM base_classes WHERE parent_name = 'MyClass'
+  SELECT derived_name, base_name, 0 as depth FROM base_classes WHERE derived_name = 'MyClass'
   UNION ALL
-  SELECT bc.parent_name, bc.base_name, h.depth + 1
+  SELECT bc.derived_name, bc.base_name, h.depth + 1
   FROM base_classes bc
-  JOIN hierarchy h ON bc.parent_name = h.base_name
+  JOIN hierarchy h ON bc.derived_name = h.base_name
   WHERE h.depth < 5
 )
 SELECT * FROM hierarchy;
@@ -277,18 +272,17 @@ Object files (compilation units).
 |--------|------|-------------|
 | `id` | INT | Compiland ID |
 | `name` | TEXT | Object file name |
-| `library_name` | TEXT | Static library name |
-| `source_file` | TEXT | Primary source file |
+| `library` | TEXT | Static library name |
 | `language` | INT | Language code |
 
 ```sql
 -- List all object files
-SELECT name, library_name FROM compilands ORDER BY name;
+SELECT name, library FROM compilands ORDER BY name;
 
 -- Count object files per library
-SELECT library_name, COUNT(*) as obj_count
+SELECT library, COUNT(*) as obj_count
 FROM compilands
-GROUP BY library_name
+GROUP BY library
 ORDER BY obj_count DESC;
 ```
 
@@ -300,7 +294,6 @@ Source file paths referenced in debug info.
 | `id` | INT | File ID |
 | `filename` | TEXT | Source file path |
 | `checksum_type` | INT | Checksum algorithm |
-| `checksum` | TEXT | File checksum (hex) |
 
 ```sql
 -- List all source files
@@ -342,24 +335,23 @@ PE sections from section contributions.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `section_number` | INT | Section number |
-| `name` | TEXT | Section name |
+| `number` | INT | Section number |
 | `rva` | INT | Section RVA |
 | `length` | INT | Section size |
 | `characteristics` | INT | Section flags |
-| `read` | INT | 1 if readable |
-| `write` | INT | 1 if writable |
-| `execute` | INT | 1 if executable |
+| `readable` | INT | 1 if readable |
+| `writable` | INT | 1 if writable |
+| `executable` | INT | 1 if executable |
 | `code` | INT | 1 if code section |
 
 ```sql
 -- Code sections
-SELECT name, printf('0x%X', rva) as addr, length
-FROM sections WHERE execute = 1;
+SELECT number, printf('0x%X', rva) as addr, length
+FROM sections WHERE executable = 1;
 
 -- Data sections
-SELECT name, printf('0x%X', rva) as addr, length
-FROM sections WHERE write = 1 AND execute = 0;
+SELECT number, printf('0x%X', rva) as addr, length
+FROM sections WHERE writable = 1 AND executable = 0;
 ```
 
 ### Function-Scoped Tables
@@ -371,25 +363,25 @@ Local variables within functions.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `function_id` | INT | Parent function ID |
-| `function_name` | TEXT | Parent function name |
+| `func_id` | INT | Parent function ID |
+| `func_name` | TEXT | Parent function name |
 | `id` | INT | Variable ID |
 | `name` | TEXT | Variable name |
-| `type_name` | TEXT | Variable type |
-| `length` | INT | Size in bytes |
-| `rva` | INT | Address (if applicable) |
+| `type` | TEXT | Variable type |
+| `location_type` | INT | DIA location enum (0=null, 1=static, 2=regrel, 4=enregistered, etc.) |
+| `offset_or_register` | INT | Stack offset (when location_type=regrel) or register number (when enregistered) |
 
 ```sql
 -- SLOW: Scans all functions
 SELECT * FROM locals;
 
--- FAST: Filter by function_id
-SELECT name, type_name FROM locals WHERE function_id = 12345;
+-- FAST: Filter by func_id
+SELECT name, type FROM locals WHERE func_id = 12345;
 
 -- Join with functions
-SELECT f.name, l.name as var_name, l.type_name
+SELECT f.name, l.name as var_name, l.type
 FROM functions f
-JOIN locals l ON f.id = l.function_id
+JOIN locals l ON f.id = l.func_id
 WHERE f.name = 'main';
 ```
 
@@ -398,18 +390,19 @@ Function parameters.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `function_id` | INT | Parent function ID |
-| `function_name` | TEXT | Parent function name |
+| `func_id` | INT | Parent function ID |
+| `func_name` | TEXT | Parent function name |
 | `id` | INT | Parameter ID |
 | `name` | TEXT | Parameter name |
-| `type_name` | TEXT | Parameter type |
-| `length` | INT | Size in bytes |
+| `type` | TEXT | Parameter type |
+| `location_type` | INT | DIA location enum |
+| `offset_or_register` | INT | Stack offset or register number (per location_type) |
 
 ```sql
 -- Parameters of a specific function
-SELECT name, type_name
+SELECT name, type
 FROM parameters
-WHERE function_name = 'MyFunction';
+WHERE func_name = 'MyFunction';
 ```
 
 ---
@@ -430,7 +423,7 @@ SELECT undecorated, rva FROM functions WHERE undecorated LIKE '%vector%';
 
 ```sql
 -- Find all structs with a specific member
-SELECT DISTINCT parent_name
+SELECT DISTINCT udt_name
 FROM udt_members
 WHERE name = 'dwSize';
 
@@ -499,17 +492,17 @@ ORDER BY total_code_size DESC;
 ```sql
 -- All classes implementing an interface
 WITH RECURSIVE derived AS (
-  SELECT parent_name, base_name, 1 as level
+  SELECT derived_name, base_name, 1 as level
   FROM base_classes WHERE base_name = 'IUnknown'
 
   UNION ALL
 
-  SELECT bc.parent_name, bc.base_name, d.level + 1
+  SELECT bc.derived_name, bc.base_name, d.level + 1
   FROM base_classes bc
-  JOIN derived d ON bc.base_name = d.parent_name
+  JOIN derived d ON bc.base_name = d.derived_name
   WHERE d.level < 10
 )
-SELECT DISTINCT parent_name, level FROM derived ORDER BY level, parent_name;
+SELECT DISTINCT derived_name, level FROM derived ORDER BY level, derived_name;
 ```
 
 ### Section Distribution
@@ -517,12 +510,12 @@ SELECT DISTINCT parent_name, level FROM derived ORDER BY level, parent_name;
 ```sql
 -- Symbol distribution by section
 SELECT
-  s.name as section,
+  s.number as section,
   COUNT(f.id) as function_count,
   SUM(f.length) as total_size
 FROM sections s
-LEFT JOIN functions f ON s.section_number = f.section
-GROUP BY s.section_number
+LEFT JOIN functions f ON s.number = f.section
+GROUP BY s.number
 ORDER BY total_size DESC;
 ```
 
@@ -534,10 +527,10 @@ ORDER BY total_size DESC;
 
 ```sql
 -- FAST: Uses constraint pushdown
-SELECT * FROM locals WHERE function_id = 12345;
+SELECT * FROM locals WHERE func_id = 12345;
 
 -- SLOW: Full scan
-SELECT * FROM locals WHERE function_name LIKE '%main%';
+SELECT * FROM locals WHERE func_name LIKE '%main%';
 ```
 
 ### Limit Result Sets
@@ -562,6 +555,15 @@ SELECT * FROM udts WHERE name LIKE '%Struct%';
 -- LIKE without leading wildcard is faster
 SELECT * FROM udts WHERE name LIKE 'My%';
 ```
+
+---
+
+## Aggregates (libxsql built-in)
+
+`blob_concat(value)` concatenates BLOB inputs and INTEGER 0-255 values
+into one BLOB. NULL inputs are skipped; TEXT or out-of-range INTs error.
+Use over an ordered row source, e.g.
+`SELECT hex(blob_concat(x)) FROM (SELECT ... ORDER BY ...)`.
 
 ---
 
@@ -598,8 +600,8 @@ The `language` column in `compilands` uses CV_CFL_* constants:
 | 7 | LINK |
 | 8 | CVTRES |
 | 9 | CVTPGD |
-| 10 | C# |
-| 11 | Visual Basic |
+| 10 | C# |)PROMPT"
+    R"PROMPT(| 11 | Visual Basic |
 | 12 | ILASM |
 | 13 | Java |
 | 14 | JScript |
@@ -629,8 +631,8 @@ GROUP BY language;
 ```sql
 -- Function count
 SELECT COUNT(*) FROM functions;
-)PROMPT"
-    R"PROMPT(-- Type count
+
+-- Type count
 SELECT COUNT(*) FROM udts;
 
 -- Source files
@@ -696,10 +698,10 @@ GROUP BY type;
 | Line mapping | `line_numbers` |
 | Compilands | `compilands` |
 | PE sections | `sections` |
-| Local variables | `locals WHERE function_id = X` |
-| Parameters | `parameters WHERE function_id = X` |
+| Local variables | `locals WHERE func_id = X` |
+| Parameters | `parameters WHERE func_id = X` |
 
-**Remember:** Always filter function-scoped tables (`locals`, `parameters`) by `function_id` for performance.
+**Remember:** Always filter function-scoped tables (`locals`, `parameters`) by `func_id` for performance.
 
 ---
 
@@ -712,19 +714,19 @@ GROUP BY type;
 SELECT * FROM udts WHERE name LIKE '%MyClass%';
 
 -- 2. Get its members
-SELECT name, offset, length, type_name
+SELECT name, offset, length, type
 FROM udt_members
-WHERE parent_name = 'MyClass'
+WHERE udt_name = 'MyClass'
 ORDER BY offset;
 
 -- 3. Check base classes
-SELECT base_name FROM base_classes WHERE parent_name = 'MyClass';
+SELECT base_name FROM base_classes WHERE derived_name = 'MyClass';
 
 -- 4. Find functions using this type
 SELECT f.name
 FROM functions f
-JOIN locals l ON f.id = l.function_id
-WHERE l.type_name LIKE '%MyClass%';
+JOIN locals l ON f.id = l.func_id
+WHERE l.type LIKE '%MyClass%';
 ```
 
 ### Analyze Code Coverage
@@ -749,10 +751,10 @@ LIMIT 20;
 SELECT u.name
 FROM udts u
 WHERE NOT EXISTS (
-  SELECT 1 FROM locals WHERE type_name LIKE '%' || u.name || '%'
+  SELECT 1 FROM locals WHERE type LIKE '%' || u.name || '%'
 )
 AND NOT EXISTS (
-  SELECT 1 FROM parameters WHERE type_name LIKE '%' || u.name || '%'
+  SELECT 1 FROM parameters WHERE type LIKE '%' || u.name || '%'
 )
 ORDER BY u.name;
 ```

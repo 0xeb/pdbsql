@@ -22,6 +22,12 @@ endif()
 
 add_executable(pdbsql ${PDBSQL_SOURCES})
 
+# Windows VS_VERSION_INFO resource
+xsql_add_versioninfo(pdbsql
+    FILETYPE          VFT_APP
+    DESCRIPTION       "pdbsql command-line interface for PDB files"
+    ORIGINAL_FILENAME "pdbsql.exe")
+
 if(PDBSQL_WITH_AI_AGENT)
     add_dependencies(pdbsql pdbsql_embed_prompt)
 endif()

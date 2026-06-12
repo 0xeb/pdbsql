@@ -237,8 +237,26 @@ When using AI agent mode, your prompts and query results are sent to the configu
 
 This project is licensed under the [Mozilla Public License 2.0](LICENSE).
 
+## The xsql family
+
+pdbsql is part of a family of tools that expose different binary-analysis and
+debug-information platforms through the **same** SQL surface, all built on the
+shared [libxsql](https://github.com/0xeb/libxsql) virtual-table framework. A
+query you learn against one tool largely carries over to the others.
+
+**Reverse-engineering platforms**
+- **[idasql](https://github.com/allthingsida/idasql)** — IDA Pro databases as SQL.
+- **[bnsql](https://github.com/0xeb/bnsql)** — Binary Ninja databases as SQL.
+- **[ghidrasql](https://github.com/0xeb/ghidrasql)** — Ghidra databases as SQL.
+
+**Debug info & compiler data**
+- **[dwarfsql](https://github.com/0xeb/dwarfsql)** — DWARF debug information as SQL.
+- **[clangsql](https://github.com/0xeb/clangsql)** — Clang AST as SQL.
+
+**Core**
+- **[libxsql](https://github.com/0xeb/libxsql)** — the C++ SQLite virtual-table
+  framework every tool above is built on.
+
 ## See Also
 
-- [libxsql](https://github.com/0xeb/libxsql) - SQLite virtual table framework (powers pdbsql)
 - [libagents](https://github.com/0xeb/libagents) - Unified C++ agent library (Copilot/Claude)
-- [idasql](https://github.com/0xeb/idasql) - SQL interface for IDA Pro databases

@@ -1,8 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
-project(pdbsql VERSION 0.0.2 LANGUAGES C CXX)
+project(pdbsql VERSION 0.0.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Windows VERSIONINFO wiring (version is from project() above)
+set(TOOL_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+set(TOOL_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+set(TOOL_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/versioninfo.cmake)
 
 # Windows-only (MSDIA requires COM)
 if(NOT WIN32)
@@ -26,14 +32,19 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 endif()
 
-# Find DIA SDK
+# Find DIA SDK. The DIA SDK lives at "<VS install root>/DIA SDK". Search the
+# environment-provided install dir first, then glob every Visual Studio install
+# regardless of version/edition — VS 2019/2022 use the year in the path
+# (".../2022/Enterprise"), while VS 2026+ use the major version (".../18/Enterprise").
 set(DIA_SDK_PATHS
     "$ENV{VSINSTALLDIR}/DIA SDK"
-    "C:/Program Files/Microsoft Visual Studio/2022/Professional/DIA SDK"
-    "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/DIA SDK"
-    "C:/Program Files/Microsoft Visual Studio/2022/Community/DIA SDK"
-    "C:/Program Files (x86)/Microsoft Visual Studio/2019/Professional/DIA SDK"
+    "$ENV{VCINSTALLDIR}/../DIA SDK"
 )
+file(GLOB _vs_dia_candidates
+    "C:/Program Files/Microsoft Visual Studio/*/*/DIA SDK"
+    "C:/Program Files (x86)/Microsoft Visual Studio/*/*/DIA SDK"
+)
+list(APPEND DIA_SDK_PATHS ${_vs_dia_candidates})
 
 foreach(path ${DIA_SDK_PATHS})
     if(EXISTS "${path}/include/dia2.h")
