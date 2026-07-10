@@ -4,10 +4,9 @@ set(PDBSQL_SOURCES
     main.cpp
 )
 
-# AI agent support
-if(PDBSQL_WITH_AI_AGENT)
+# MCP server support
+if(PDBSQL_WITH_MCP)
     list(APPEND PDBSQL_SOURCES
-        ../common/ai_agent.cpp
         ../common/mcp_server.cpp
         mcp_mode.cpp
     )
@@ -28,10 +27,6 @@ xsql_add_versioninfo(pdbsql
     DESCRIPTION       "pdbsql command-line interface for PDB files"
     ORIGINAL_FILENAME "pdbsql.exe")
 
-if(PDBSQL_WITH_AI_AGENT)
-    add_dependencies(pdbsql pdbsql_embed_prompt)
-endif()
-
 target_link_libraries(pdbsql PRIVATE
     xsql::xsql
     diaguids
@@ -44,15 +39,12 @@ target_link_libraries(pdbsql PRIVATE
     ws2_32
 )
 
-# AI agent dependencies
-if(PDBSQL_WITH_AI_AGENT)
-    target_link_libraries(pdbsql PRIVATE libagents::libagents fastmcpp_core)
-    target_compile_definitions(pdbsql PRIVATE PDBSQL_HAS_AI_AGENT)
-    target_include_directories(pdbsql PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../common
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../external/libagents/external/fastmcpp/include
-    )
-    message(STATUS "pdbsql CLI: AI agent support enabled")
+# MCP server support
+if(PDBSQL_WITH_MCP)
+    target_link_libraries(pdbsql PRIVATE fastmcpp_core)
+    target_compile_definitions(pdbsql PRIVATE PDBSQL_HAS_MCP)
+    target_include_directories(pdbsql PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+    message(STATUS "pdbsql CLI: MCP server support enabled")
 endif()
 
 # HTTP server support

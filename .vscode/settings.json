@@ -23,7 +23,6 @@
         "**/out": true,
         "**/CMakeFiles": true,
         "**/_deps": true,
-        "**/external/libagents/external": true,
         "**/external/libxsql/external": true,
         "**/.cache": true
     },
@@ -31,7 +30,6 @@
         "**/build/**": true,
         "**/build_*/**": true,
         "**/out/**": true,
-        "**/_deps/**": true,
-        "**/external/libagents/external/**": true
+        "**/_deps/**": true
     }
 }

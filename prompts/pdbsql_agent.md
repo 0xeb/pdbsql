@@ -549,7 +549,7 @@ SELECT * FROM udts WHERE name LIKE 'My%';
 
 ---
 
-## Aggregates (libxsql built-in)
+## Aggregates (built-in)
 
 `blob_concat(value)` concatenates BLOB inputs and INTEGER 0-255 values
 into one BLOB. NULL inputs are skipped; TEXT or out-of-range INTs error.

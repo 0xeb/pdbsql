@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -30,13 +29,11 @@ namespace pdbsql {
 
 // Callbacks for handling requests
 // QueryCallback: Direct SQL execution
-// AskCallback: Natural language query (requires AI agent)
 using QueryCallback = std::function<std::string(const std::string& sql)>;
-using AskCallback = std::function<std::string(const std::string& question)>;
 
 // Internal command structure for cross-thread execution
 struct MCPPendingCommand {
-    enum class Type { Query, Ask };
+    enum class Type { Query };
     Type type;
     std::string input;
     std::string result;
@@ -64,19 +61,18 @@ public:
      *
      * @param port Port to listen on (0 = random port 9000-9999)
      * @param query_cb SQL query callback
-     * @param ask_cb Natural language callback (optional)
      * @param bind_addr Address to bind to (default: localhost only)
      * @param use_queue If true, callbacks are queued for main thread (CLI mode)
      *                  If false, callbacks called directly
      * @return Actual port used, or -1 on failure
      */
-    int start(int port, QueryCallback query_cb, AskCallback ask_cb = nullptr,
+    int start(int port, QueryCallback query_cb,
               const std::string& bind_addr = "127.0.0.1", bool use_queue = false);
 
     /**
      * Block until server stops, processing commands on the calling thread
      * Only needed when use_queue=true (CLI mode)
-     * This is where query_cb and ask_cb get called
+     * This is where query_cb gets called
      */
     void run_until_stopped();
 
@@ -125,7 +121,6 @@ private:
 
     // Callbacks stored for execution
     QueryCallback query_cb_;
-    AskCallback ask_cb_;
 
     // Forward declaration - impl hides fastmcpp
     class Impl;
@@ -137,7 +132,7 @@ private:
 /**
  * Format MCP server info for display
  */
-std::string format_mcp_info(int port, bool has_agent);
+std::string format_mcp_info(int port);
 
 /**
  * Format MCP server status

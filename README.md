@@ -1,6 +1,6 @@
 # pdbsql
 
-Query Windows PDB files with SQL. Ask questions in plain English.
+Query Windows PDB files with SQL.
 
 ```
 $ pdbsql ntdll.pdb "SELECT name, rva FROM functions WHERE name LIKE '%Rtl%Heap%' ORDER BY rva"
@@ -12,12 +12,6 @@ $ pdbsql ntdll.pdb "SELECT name, rva FROM functions WHERE name LIKE '%Rtl%Heap%'
 | RtlAllocateHeap           | 0x1C100  |
 | RtlFreeHeap               | 0x1D420  |
 +---------------------------+----------+
-```
-
-Or just ask:
-
-```
-$ pdbsql ntdll.pdb --prompt "Find heap-related functions"
 ```
 
 ## Why SQL for PDBs?
@@ -84,63 +78,34 @@ pdbsql> .quit
 **HTTP server mode** (expose PDB over HTTP):
 ```bash
 # Terminal 1: Start server
-pdbsql test.pdb --http 8081 --token secret123
+pdbsql test.pdb --http 8080 --token secret123
 
 # Terminal 2: Query over HTTP
-curl -X POST http://localhost:8081/query -H "Authorization: Bearer secret123" -d "SELECT * FROM sections"
+curl -X POST http://localhost:8080/query -H "Authorization: Bearer secret123" -d "SELECT * FROM sections"
 ```
+> **Note:** `--token` guards the HTTP API only; the MCP endpoint (`--mcp`) is unauthenticated.
 
-## AI Agent Mode
-
-Don't know SQL? Don't know the schema? Just ask.
-
+**MCP server mode** (Model Context Protocol, for MCP clients):
 ```bash
-pdbsql kernel32.pdb --prompt "Which functions reference the string 'LoadLibrary'?"
-pdbsql ntdll.pdb --prompt "Show me the largest 10 C++ classes with their member counts"
-pdbsql myapp.pdb --prompt "Find all virtual functions in classes that inherit from IUnknown"
+# Random port 9000-9999, or pass an explicit port
+pdbsql test.pdb --mcp
+pdbsql test.pdb --mcp 9123
 ```
+The MCP server exposes a single tool, `pdbsql_query`, that runs SQL directly against the PDB.
 
-**Interactive with AI:**
-```bash
-pdbsql test.pdb -i --agent
+## Using pdbsql with an AI agent
 
-pdbsql> what tables are available?
-pdbsql> find functions that look like constructors
-pdbsql> show me structs larger than 4KB
-pdbsql> which source files have the most functions?
-```
+pdbsql is a plain SQL CLI — it does **not** embed or run its own AI agent. To let an
+external agent or LLM (Claude, Copilot, or any assistant) drive pdbsql, point it at the
+tool two ways:
 
-The agent translates your questions to SQL, runs the query, and explains results. SQL passthrough still works - if you type `SELECT ...`, it executes directly.
-
-### Prerequisites for AI Features
-
-The AI agent requires one of these CLI tools installed and authenticated:
-
-| Provider | CLI Tool | Install | Login |
-|----------|----------|---------|-------|
-| Claude (default) | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm install -g @anthropic-ai/claude-code` | Run `claude`, then `/login` |
-| GitHub Copilot | [Copilot CLI](https://github.com/features/copilot/cli/) | `npm install -g @github/copilot` | Run `copilot`, then `/login` |
-
-**Important:** You must be logged in before using AI features.
-
-### Agent Setup
-
-The agent uses [libagents](https://github.com/0xeb/libagents) to connect to LLM providers. Configure once:
-
-```bash
-pdbsql test.pdb -i
-pdbsql> .agent provider copilot
-pdbsql> .agent byok enable
-pdbsql> .agent byok key YOUR_API_KEY
-pdbsql> .agent byok endpoint https://api.openai.com/v1
-pdbsql> .agent byok model gpt-4
-pdbsql> .agent byok type openai
-```
-
-Settings persist to `%APPDATA%\pdbsql\agent_settings.json`.
-
-Supported providers: `copilot`, `claude`
-BYOK types: `openai`, `anthropic`, `azure`
+- **As a system prompt:** feed [`prompts/pdbsql_agent.md`](prompts/pdbsql_agent.md) to
+  your model as its system/instruction prompt. It documents the full SQL schema, every
+  table and column, and worked query patterns, so the model can translate
+  natural-language questions into pdbsql SQL and run them via `-q` / `--http` / `--mcp`.
+- **Over MCP:** start `pdbsql file.pdb --mcp` and connect any MCP client (see MCP server
+  mode above). The client's own model does the reasoning; pdbsql exposes the
+  `pdbsql_query` tool that executes SQL against the PDB.
 
 ## Real-World Examples
 
@@ -157,16 +122,19 @@ WHERE rva <= 0x12345 AND rva + length > 0x12345;
 -- Largest functions (complexity indicators)
 SELECT name, length FROM functions ORDER BY length DESC LIMIT 20;
 
--- Code vs data ratio per section
-SELECT name, virtual_size, characteristics FROM sections;
+-- Executable sections with their sizes and flags
+SELECT number, rva, length, characteristics, readable, writable, executable FROM sections;
 ```
 
 **Reverse engineering prep:**
 ```sql
--- Find interesting string references
-SELECT f.name, f.rva FROM functions f
-JOIN line_numbers ln ON f.id = ln.function_id
-WHERE ln.source_file LIKE '%crypto%';
+-- Find source files contributing to a given compiland
+SELECT sf.filename, c.name AS compiland
+FROM source_files sf
+JOIN line_numbers ln ON ln.file_id = sf.id
+JOIN compilands c ON c.id = ln.compiland_id
+WHERE sf.filename LIKE '%crypto%'
+GROUP BY sf.filename, c.name;
 
 -- Virtual function tables (C++ RE)
 SELECT u.name, COUNT(m.id) as vtable_size
@@ -185,27 +153,6 @@ ORDER BY name;
 -- Save to file, diff against another version
 ```
 
-## For AI Agents (MCP/Tool Use)
-
-pdbsql exposes a single tool: `pdbsql(query: string) -> string`
-
-The tool accepts SQL queries and returns formatted results. AI agents can:
-
-1. Explore schema with `.tables` and `.schema <table>`
-2. Run queries and iterate based on results
-3. Combine multiple queries to answer complex questions
-
-**System prompt snippet for your agent:**
-```
-You have access to a PDB file via the pdbsql tool. Available tables:
-functions, publics, udts, udt_members, enums, enum_values, typedefs,
-data, sections, compilands, source_files, line_numbers, locals, parameters.
-
-Use SQL to explore. Start with schema discovery, then targeted queries.
-```
-
-The embedded agent prompt includes full schema documentation - just enable `--agent` and it handles the rest.
-
 ## Building
 
 **Requirements:**
@@ -218,7 +165,7 @@ The embedded agent prompt includes full schema documentation - just enable `--ag
 git clone --recursive https://github.com/0xeb/pdbsql.git
 cd pdbsql
 
-# Initialize nested submodules (for AI agent support)
+# Initialize submodules (libxsql)
 git submodule update --init --recursive
 
 cmake -B build
@@ -227,15 +174,22 @@ cmake --build build --config Release
 ```
 
 **Build options:**
-- `PDBSQL_WITH_AI_AGENT=ON` (default): Enable AI agent support
+- `PDBSQL_WITH_HTTP=ON` (default): HTTP REST server
+- `PDBSQL_WITH_MCP=ON` (default): MCP server (SSE), fetches fastmcpp
 
-## Privacy Note
+## License and Terms of Use
 
-When using AI agent mode, your prompts and query results are sent to the configured LLM provider. Don't use this with sensitive symbols unless you're comfortable with that data leaving your machine. Local SQL mode (`-i` without `--agent`) processes everything locally.
+In short: you may read, build, evaluate, benchmark, package, and use unmodified pdbsql, including commercially, if you preserve notices and follow the license terms. You may fork or patch it to prepare bug fixes, optimizations, features, tests, or documentation improvements for contribution back within the license's contribution-purpose rules.
 
-## License
+You may not maintain a divergent private fork, port, rebrand, clone, API-compatible replacement, competing implementation, or use pdbsql as AI input to recreate or improve a derivative implementation without prior written permission from Elias Bachaalany. Independent implementations that are not copied from, materially derived from, or substantially informed by pdbsql in the license's defined sense are not prohibited.
 
-This project is licensed under the [Mozilla Public License 2.0](LICENSE).
+Permission requests: open a GitHub issue at [0xeb/pdbsql/issues](https://github.com/0xeb/pdbsql/issues).
+
+If pdbsql materially informs a distributed project, preserve the human origin: credit pdbsql and Elias Bachaalany visibly in your README/docs and in About/credits UI when applicable. The license includes an examples/FAQ section for common allowed and permission-required uses. Third-party dependencies (libxsql, the Windows Debug Interface Access (DIA) SDK, and their transitive dependencies) remain under their own licenses.
+
+See the full [Human-Origin Source License v1.0](LICENSE).
+
+Releases up to v0.0.3 remain under the MPL-2.0 they were published with; v0.0.4 and all subsequent releases are under the Human-Origin Source License v1.0.
 
 ## The xsql family
 
@@ -256,7 +210,3 @@ query you learn against one tool largely carries over to the others.
 **Core**
 - **[libxsql](https://github.com/0xeb/libxsql)** — the C++ SQLite virtual-table
   framework every tool above is built on.
-
-## See Also
-
-- [libagents](https://github.com/0xeb/libagents) - Unified C++ agent library (Copilot/Claude)

@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include "mcp_server.hpp"
 
@@ -66,14 +65,13 @@ MCPQueueResult PdbsqlMCPServer::queue_and_wait(MCPPendingCommand::Type type, con
     return {true, cmd.result};
 }
 
-int PdbsqlMCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
+int PdbsqlMCPServer::start(int port, QueryCallback query_cb,
                             const std::string& bind_addr, bool use_queue) {
     if (running_.load()) {
         return port_;
     }
 
     query_cb_ = query_cb;
-    ask_cb_ = ask_cb;
     bind_addr_ = bind_addr;
     use_queue_.store(use_queue);
 
@@ -152,72 +150,10 @@ int PdbsqlMCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
     sql_query_tool.set_description("Execute a SQL query against the PDB debug symbols database and return results");
     impl_->tool_manager.register_tool(sql_query_tool);
 
-    // Register pdbsql_agent tool - natural language query (if ask_cb provided)
-    if (ask_cb_) {
-        Json ask_input_schema = {
-            {"type", "object"},
-            {"properties", {
-                {"question", {
-                    {"type", "string"},
-                    {"description", "Natural language question about the PDB debug symbols (e.g., 'What are the largest functions?')"}
-                }}
-            }},
-            {"required", Json::array({"question"})}
-        };
-
-        Json ask_output_schema = {
-            {"type", "object"},
-            {"properties", {
-                {"response", {{"type", "string"}}},
-                {"success", {{"type", "boolean"}}}
-            }}
-        };
-
-        fastmcpp::tools::Tool agent_ask_tool{
-            "pdbsql_agent",
-            ask_input_schema,
-            ask_output_schema,
-            [this](const Json& args) -> Json {
-                std::string question = args.value("question", "");
-                if (question.empty()) {
-                    return Json{
-                        {"content", Json::array({
-                            Json{{"type", "text"}, {"text", "Error: missing question"}}
-                        })},
-                        {"isError", true}
-                    };
-                }
-
-                std::string result;
-                bool success = true;
-
-                if (use_queue_.load()) {
-                    auto qr = queue_and_wait(MCPPendingCommand::Type::Ask, question);
-                    result = qr.payload;
-                    success = qr.success;
-                } else {
-                    result = ask_cb_(question);
-                }
-
-                return Json{
-                    {"content", Json::array({
-                        Json{{"type", "text"}, {"text", result}}
-                    })},
-                    {"isError", !success}
-                };
-            }
-        };
-        agent_ask_tool.set_description("Ask a natural language question about the PDB debug symbols - AI translates to SQL and returns results");
-        impl_->tool_manager.register_tool(agent_ask_tool);
-    }
-
     // Create MCP handler
     std::unordered_map<std::string, std::string> descriptions = {
         {"pdbsql_query", "Execute a SQL query against the PDB debug symbols database and return results"}
     };
-    if (ask_cb_) {
-        descriptions["pdbsql_agent"] = "Ask a natural language question about the PDB debug symbols - AI translates to SQL and returns results";
-    }
 
     auto handler = fastmcpp::mcp::make_mcp_handler(
         "pdbsql",
@@ -274,8 +210,6 @@ void PdbsqlMCPServer::run_until_stopped() {
             try {
                 if (cmd->type == MCPPendingCommand::Type::Query && query_cb_) {
                     cmd->result = query_cb_(cmd->input);
-                } else if (cmd->type == MCPPendingCommand::Type::Ask && ask_cb_) {
-                    cmd->result = ask_cb_(cmd->input);
                 } else {
                     cmd->result = "Error: No handler for command type";
                 }
@@ -337,16 +271,13 @@ std::string PdbsqlMCPServer::url() const {
     return ss.str();
 }
 
-std::string format_mcp_info(int port, bool has_agent) {
+std::string format_mcp_info(int port) {
     std::ostringstream ss;
     ss << "MCP server started on port " << port << "\n";
     ss << "SSE endpoint: http://127.0.0.1:" << port << "/sse\n\n";
 
     ss << "Available tools:\n";
     ss << "  pdbsql_query  - Execute SQL query directly\n";
-    if (has_agent) {
-        ss << "  pdbsql_agent  - Ask natural language question (AI-powered)\n";
-    }
     ss << "\n";
 
     ss << "Add to Claude Desktop config:\n";

@@ -1,5 +1,13 @@
+#
+# Copyright (c) 2024-2026 Elias Bachaalany
+# SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+#
+# This file is licensed under the Human-Origin Source License v1.0.
+# See LICENSE.
+#
+
 cmake_minimum_required(VERSION 3.20)
-project(pdbsql VERSION 0.0.3 LANGUAGES C CXX)
+project(pdbsql VERSION 0.0.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,9 +23,8 @@ if(NOT WIN32)
     message(FATAL_ERROR "pdbsql requires Windows (MSDIA COM)")
 endif()
 
-# AI Agent support (optional)
-option(PDBSQL_WITH_AI_AGENT "Enable AI agent support via libagents" ON)
 option(PDBSQL_WITH_HTTP "Build with HTTP REST server support" ON)
+option(PDBSQL_WITH_MCP "Build with MCP server support (fastmcpp)" ON)
 
 # HTTP support requires thinclient from libxsql
 if(PDBSQL_WITH_HTTP)
@@ -89,39 +96,29 @@ else()
 endif()
 
 # ============================================================================
-# libagents dependency (AI agent support)
+# MCP support (optional, uses fastmcpp)
 # ============================================================================
 
-if(PDBSQL_WITH_AI_AGENT)
-    if(TARGET libagents::libagents)
-        message(STATUS "pdbsql: Using libagents::libagents from parent project")
-    else()
-        message(STATUS "pdbsql: Fetching libagents from GitHub...")
-        set(LIBAGENTS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-        set(LIBAGENTS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-        set(LIBAGENTS_BUILD_CLI OFF CACHE BOOL "" FORCE)
+if(PDBSQL_WITH_MCP)
+    message(STATUS "pdbsql: Building with MCP support via fastmcpp")
+    if(NOT TARGET fastmcpp_core)
+        set(FASTMCPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_ENABLE_POST_STREAMING OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_ENABLE_SAMPLING_HTTP_HANDLERS OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_FETCH_CURL OFF CACHE BOOL "" FORCE)
+        message(STATUS "pdbsql: Fetching fastmcpp from GitHub...")
         include(FetchContent)
-        FetchContent_Declare(libagents
-            GIT_REPOSITORY https://github.com/0xeb/libagents.git
+        FetchContent_Declare(fastmcpp
+            GIT_REPOSITORY https://github.com/0xeb/fastmcpp.git
             GIT_TAG        main
             GIT_SHALLOW    TRUE
         )
-        FetchContent_MakeAvailable(libagents)
+        FetchContent_MakeAvailable(fastmcpp)
     endif()
-
-    # Embed the system prompt
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(PROMPT_MD "${CMAKE_CURRENT_SOURCE_DIR}/prompts/pdbsql_agent.md")
-    set(PROMPT_HPP "${CMAKE_CURRENT_SOURCE_DIR}/src/common/pdbsql_agent_prompt.hpp")
-    add_custom_command(
-        OUTPUT ${PROMPT_HPP}
-        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_prompt.py"
-                "${PROMPT_MD}" "${PROMPT_HPP}"
-        DEPENDS ${PROMPT_MD}
-        COMMENT "Embedding pdbsql_agent.md into pdbsql_agent_prompt.hpp"
-        VERBATIM
-    )
-    add_custom_target(pdbsql_embed_prompt DEPENDS ${PROMPT_HPP})
+    if(MSVC AND TARGET fastmcpp_core)
+        target_compile_options(fastmcpp_core PRIVATE /MP)
+    endif()
 endif()
 
 # Main includes
