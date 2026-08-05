@@ -22,7 +22,7 @@
  *   compilands    - Object files / compilation units
  *   source_files  - Source file paths
  *   line_numbers  - Source line to RVA mapping
- *   sections      - PE sections from section contributions
+ *   sections      - PE sections from the SECTIONHEADERS debug stream (named)
  *   thunks        - Thunk symbols (import stubs, etc.)
  *   labels        - Code labels
  *   udt_members   - UDT member fields (struct/class members)
@@ -34,7 +34,9 @@
 
 #include <xsql/xsql.hpp>
 #include <xsql/database.hpp>
+#include <xsql/runtime_settings_table.hpp>
 #include "pdb_session.hpp"
+#include "pdb_runtime_settings.hpp"
 #include <algorithm>
 #include <vector>
 #include <memory>
@@ -150,6 +152,17 @@ inline size_t to_size_t_clamped(LONG v) {
     return static_cast<size_t>(v);
 }
 
+// Cheap planner row-count hint for the symbol tables. estimate_rows() is called
+// by the vtable's xBestIndex during planning of EVERY query on the table (not
+// just COUNT), so it must be cheap: it must NOT call DIA's get_Count, whose cost
+// scales with the number of symbols realized and can be seconds on a large PDB.
+// estimate_rows is only an optimizer hint (estimatedRows/estimatedCost) and never
+// affects results; the exact count still comes from row_count() on the
+// COUNT_ONLY_SCAN path. A deliberately large value keeps the planner treating
+// these as big tables (vs libxsql's 1000 GeneratorTableDef default, which would
+// under-estimate ~1000x and invite bad nested-loop join plans).
+constexpr size_t kSymbolRowEstimate = 1000000;
+
 inline std::string safe_symbol_name(IDiaSymbol* symbol) {
     if (!symbol) return "";
     SafeBSTR name;
@@ -159,7 +172,25 @@ inline std::string safe_symbol_name(IDiaSymbol* symbol) {
     return "";
 }
 
-inline CachedSymbol extract_symbol(IDiaSymbol* symbol) {
+// Which expensive per-symbol fields to materialize. Driven by SQLite's colUsed so a
+// full scan that does not SELECT the undecorated name skips the (dominant-cost) C++
+// demangle. Default = compute everything: used by the bounded name/id filter lookups
+// where the per-row cost is negligible and any column may be selected.
+struct SymbolProjection {
+    bool undecorated = true;  // get_undecoratedName — the expensive demangle
+};
+
+// Build a full-scan projection from colUsed. undecorated_col is the 0-based index of
+// the `undecorated` column in the table's schema, or -1 when the table has no such
+// column (then the demangle is always skipped — it was pure waste before).
+inline SymbolProjection symbol_projection_from(uint64_t col_used, int undecorated_col) {
+    SymbolProjection p;
+    p.undecorated = undecorated_col >= 0 &&
+                    (col_used & (static_cast<uint64_t>(1) << undecorated_col)) != 0;
+    return p;
+}
+
+inline CachedSymbol extract_symbol(IDiaSymbol* symbol, SymbolProjection proj = {}) {
     CachedSymbol cs;
     if (!symbol) return cs;
 
@@ -170,9 +201,13 @@ inline CachedSymbol extract_symbol(IDiaSymbol* symbol) {
         cs.name = name.str();
     }
 
-    SafeBSTR undec;
-    if (SUCCEEDED(symbol->get_undecoratedName(undec.ptr()))) {
-        cs.undecorated = undec.str();
+    // The undecorated (demangled) name is by far the most expensive field; skip it
+    // unless the query selects it (or a bounded lookup asks for everything).
+    if (proj.undecorated) {
+        SafeBSTR undec;
+        if (SUCCEEDED(symbol->get_undecoratedName(undec.ptr()))) {
+            cs.undecorated = undec.str();
+        }
     }
 
     symbol->get_relativeVirtualAddress(&cs.rva);
@@ -186,6 +221,23 @@ inline CachedSymbol extract_symbol(IDiaSymbol* symbol) {
     cs.offset = offset;
 
     return cs;
+}
+
+// Human-readable SymTagEnum name for the `symbol_at.kind` column. Covers the tags
+// findSymbolByRVA(SymTagNull) can return; anything else falls back to "other".
+inline const char* symtag_name(DWORD tag) {
+    switch (static_cast<enum SymTagEnum>(tag)) {
+        case SymTagFunction:     return "Function";
+        case SymTagData:         return "Data";
+        case SymTagPublicSymbol: return "PublicSymbol";
+        case SymTagLabel:        return "Label";
+        case SymTagThunk:        return "Thunk";
+        case SymTagBlock:        return "Block";
+        case SymTagUDT:          return "UDT";
+        case SymTagEnum:         return "Enum";
+        case SymTagTypedef:      return "Typedef";
+        default:                 return "other";
+    }
 }
 
 inline CachedCompiland extract_compiland(IDiaSymbol* symbol) {
@@ -229,13 +281,15 @@ inline CachedSourceFile extract_source_file(IDiaSourceFile* file) {
 class SymbolGenerator : public xsql::Generator<CachedSymbol> {
     PdbSession& session_;
     enum SymTagEnum tag_;
+    SymbolProjection proj_;
     CComPtr<IDiaEnumSymbols> symbols_;
     CachedSymbol current_;
     int64_t rowid_ = -1;
     bool started_ = false;
 
 public:
-    SymbolGenerator(PdbSession& session, enum SymTagEnum tag) : session_(session), tag_(tag) {}
+    SymbolGenerator(PdbSession& session, enum SymTagEnum tag, SymbolProjection proj = {})
+        : session_(session), tag_(tag), proj_(proj) {}
 
     bool next() override {
         if (!started_) {
@@ -250,7 +304,7 @@ public:
             return false;
         }
 
-        current_ = extract_symbol(symbol);
+        current_ = extract_symbol(symbol, proj_);
         ++rowid_;
         return true;
     }
@@ -443,69 +497,62 @@ class SectionGenerator : public xsql::Generator<CachedSection> {
         IDiaSession* dia_session = session_.session();
         if (!dia_session) return;
 
-        CComPtr<IDiaEnumTables> tables;
-        if (FAILED(dia_session->getEnumTables(&tables)) || !tables) return;
+        // Real PE sections come from the DIA "SECTIONHEADERS" debug stream (each
+        // record is an IMAGE_SECTION_HEADER), NOT from SectionContribs. Optimized
+        // Unreal Engine PDBs carry section headers but no SectionContribs stream,
+        // so the old approach returned 0 rows. Section
+        // *names* (.text/.data/…) also only exist here. Fall back to the
+        // pre-incremental-link "SECTIONHEADERSORIG" stream when the primary is
+        // absent.
+        CComPtr<IDiaEnumDebugStreams> streams;
+        if (FAILED(dia_session->getEnumDebugStreams(&streams)) || !streams) return;
 
-        // Find section contributions table
-        CComPtr<IDiaEnumSectionContribs> contribs;
-        CComPtr<IDiaTable> table;
-        ULONG tfetched = 0;
-        while (SUCCEEDED(tables->Next(1, &table, &tfetched)) && tfetched == 1) {
+        CComPtr<IDiaEnumDebugStreamData> chosen;
+        CComPtr<IDiaEnumDebugStreamData> fallback;
+        CComPtr<IDiaEnumDebugStreamData> stream;
+        ULONG sfetched = 0;
+        while (SUCCEEDED(streams->Next(1, &stream, &sfetched)) && sfetched == 1) {
             SafeBSTR name;
-            if (SUCCEEDED(table->get_name(name.ptr()))) {
-                if (wcscmp(name.get(), L"SectionContribs") == 0) {
-                    table->QueryInterface(IID_IDiaEnumSectionContribs, (void**)&contribs);
-                    break;
+            if (SUCCEEDED(stream->get_name(name.ptr())) && name.get()) {
+                if (wcscmp(name.get(), L"SECTIONHEADERS") == 0) {
+                    chosen = stream;
+                } else if (wcscmp(name.get(), L"SECTIONHEADERSORIG") == 0) {
+                    fallback = stream;
                 }
             }
-            table.Release();
+            stream.Release();
+            if (chosen) break;
         }
-        if (!contribs) return;
+        if (!chosen) chosen = fallback;
+        if (!chosen) return;
 
-        std::unordered_map<DWORD, CachedSection> sections;
+        // Each stream record is one IMAGE_SECTION_HEADER (40 bytes).
+        DWORD ordinal = 0;
+        for (;;) {
+            IMAGE_SECTION_HEADER hdr{};
+            DWORD cb = 0;
+            ULONG cfetched = 0;
+            HRESULT hr = chosen->Next(1, sizeof(hdr), &cb,
+                                      reinterpret_cast<BYTE*>(&hdr), &cfetched);
+            if (FAILED(hr) || cfetched != 1 || cb < sizeof(hdr)) break;
 
-        CComPtr<IDiaSectionContrib> contrib;
-        ULONG cfetched = 0;
-        while (SUCCEEDED(contribs->Next(1, &contrib, &cfetched)) && cfetched == 1) {
-            DWORD sec_num = 0;
-            contrib->get_addressSection(&sec_num);
+            CachedSection cs{};
+            cs.section_number = ++ordinal;  // 1-based PE section ordinal
 
-            DWORD rva = 0, len = 0;
-            contrib->get_relativeVirtualAddress(&rva);
-            contrib->get_length(&len);
+            // IMAGE_SECTION_HEADER::Name is 8 bytes, not guaranteed NUL-terminated.
+            char namebuf[IMAGE_SIZEOF_SHORT_NAME + 1] = {0};
+            memcpy(namebuf, hdr.Name, IMAGE_SIZEOF_SHORT_NAME);
+            cs.name = namebuf;
 
-            auto [it, inserted] = sections.emplace(sec_num, CachedSection{});
-            CachedSection& cs = it->second;
-
-            if (inserted) {
-                cs.section_number = sec_num;
-                cs.rva = rva;
-                cs.length = len;
-
-                BOOL val = FALSE;
-                if (SUCCEEDED(contrib->get_read(&val))) cs.read = (val != FALSE);
-                if (SUCCEEDED(contrib->get_write(&val))) cs.write = (val != FALSE);
-                if (SUCCEEDED(contrib->get_execute(&val))) cs.execute = (val != FALSE);
-                if (SUCCEEDED(contrib->get_code(&val))) cs.code = (val != FALSE);
-            } else {
-                DWORD end = rva + len;
-                DWORD cur_end = cs.rva + cs.length;
-                if (end > cur_end) {
-                    cs.length = end - cs.rva;
-                }
-            }
-
-            contrib.Release();
+            cs.rva = hdr.VirtualAddress;
+            cs.length = hdr.Misc.VirtualSize;
+            cs.characteristics = hdr.Characteristics;
+            cs.read = (hdr.Characteristics & IMAGE_SCN_MEM_READ) != 0;
+            cs.write = (hdr.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+            cs.execute = (hdr.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+            cs.code = (hdr.Characteristics & IMAGE_SCN_CNT_CODE) != 0;
+            sections_.push_back(cs);
         }
-
-        sections_.reserve(sections.size());
-        for (const auto& [num, sec] : sections) {
-            sections_.push_back(sec);
-        }
-
-        std::sort(sections_.begin(), sections_.end(), [](const CachedSection& a, const CachedSection& b) {
-            return a.section_number < b.section_number;
-        });
     }
 
 public:
@@ -995,6 +1042,34 @@ inline void add_filter_eq_text(GeneratorTableDef<RowData>& def,
         });
 }
 
+// Registers a GT/GE/LT/LE range pushdown on one column, ascending-ordered. Mirrors
+// xsql::GeneratorTableBuilder::constraint_filter()+order_by_consumed(), but as a
+// direct field mutation matching add_filter_eq's style, since functions_/publics_
+// are already-built GeneratorTableDef instances, not live builders.
+template<typename RowData>
+inline void add_constraint_range_filter(
+        GeneratorTableDef<RowData>& def,
+        const char* column_name,
+        std::function<std::unique_ptr<xsql::Generator<RowData>>(
+            const std::vector<xsql::GeneratorConstraintArg>&)> factory,
+        double cost = 5.0,
+        double est_rows = 1000.0) {
+    int col_idx = def.find_column(column_name ? column_name : "");
+    if (col_idx < 0) return;
+    xsql::ConstraintFilterDef<RowData> cf;
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Gt, false, ""});
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Ge, false, ""});
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Lt, false, ""});
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Le, false, ""});
+    cf.filter_id = xsql::CONSTRAINT_FILTER_BASE + static_cast<int>(def.constraint_filters.size());
+    cf.estimated_cost = cost;
+    cf.estimated_rows = est_rows;
+    cf.ordered_column = col_idx;
+    cf.ordered_desc = false;
+    cf.create = std::move(factory);
+    def.constraint_filters.push_back(std::move(cf));
+}
+
 // Filtered generators used by constraint pushdown (xBestIndex/xFilter).
 
 class SymbolByNameGenerator : public xsql::Generator<CachedSymbol> {
@@ -1085,6 +1160,194 @@ public:
     const CachedSymbol& current() const override { return current_; }
     int64_t rowid() const override { return rowid_; }
 };
+
+// Emits the single symbol at an exact RVA via DIA's native findSymbolByRVA (a direct
+// address-index lookup — no full walk, no cache). findSymbolByRVA is containment-based,
+// so we confirm the exact start to honor `WHERE rva = X` (SQLite omits the recheck).
+class SymbolByRvaGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    DWORD rva_ = 0;
+    enum SymTagEnum tag_;
+    CachedSymbol current_;
+    bool emitted_ = false;
+    int64_t rowid_ = -1;
+
+public:
+    SymbolByRvaGenerator(PdbSession& session, DWORD rva, enum SymTagEnum tag)
+        : session_(session), rva_(rva), tag_(tag) {}
+
+    bool next() override {
+        if (emitted_) return false;
+        emitted_ = true;
+
+        CComPtr<IDiaSymbol> symbol = session_.find_symbol_by_rva(rva_, tag_);
+        if (!symbol) return false;
+
+        DWORD got_rva = 0;
+        if (FAILED(symbol->get_relativeVirtualAddress(&got_rva)) || got_rva != rva_) {
+            return false;  // containment hit that does not start exactly at rva_
+        }
+
+        current_ = extract_symbol(symbol);
+        rowid_ = 0;
+        return true;
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// Emits the single innermost symbol of ANY kind CONTAINING an address, via DIA's
+// findSymbolByRVA(SymTagNull) — the engine of the `symbol_at(addr)` table-valued
+// function. Unlike SymbolByRvaGenerator (exact-start `WHERE rva = X`), this KEEPS a
+// containment hit. Measured DIA behavior (kb symbol-at-lab/FINDINGS.md) is
+// nearest-at-or-below, so we confirm the address truly falls within
+// [start, start+length) before emitting; an address in a gap yields no row.
+class SymbolAtRvaGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    DWORD rva_ = 0;
+    CachedSymbol current_;
+    bool done_ = false;   // out-of-range address, or already decided
+    int64_t rowid_ = -1;
+
+public:
+    SymbolAtRvaGenerator(PdbSession& session, int64_t addr) : session_(session) {
+        if (addr < 0 || addr > 0xFFFFFFFFLL) done_ = true;  // not a valid RVA: no rows
+        else rva_ = static_cast<DWORD>(addr);
+    }
+
+    bool next() override {
+        if (done_) return false;
+        done_ = true;
+
+        CComPtr<IDiaSymbol> symbol = session_.find_symbol_by_rva(rva_, SymTagNull);
+        if (!symbol) return false;
+
+        DWORD got_rva = 0;
+        ULONGLONG got_len = 0;
+        symbol->get_relativeVirtualAddress(&got_rva);
+        symbol->get_length(&got_len);
+        // findSymbolByRVA is nearest-at-or-below, so verify true containment before
+        // emitting — otherwise a distant nearest-below symbol (e.g. a zero-length data
+        // symbol at rva 0) would be wrongly returned for an address in a gap.
+        if (got_rva > rva_) return false;                       // starts after the address
+        if (got_len > 0) {
+            // Sized symbol: the address must fall within [start, start+length).
+            if (static_cast<ULONGLONG>(rva_) >= static_cast<ULONGLONG>(got_rva) + got_len)
+                return false;                                   // past the symbol's end
+        } else if (got_rva != rva_) {
+            return false;  // a zero-length symbol contains only its own exact address
+        }
+
+        current_ = extract_symbol(symbol);
+        rowid_ = 0;
+        return true;
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// Emits symbols of `tag_` whose rva falls within a bounded, half-open [start_, end_)
+// range, via DIA's address-ordered enumerator: one symbolByRVA seek to `start_`, then
+// a linear Next() walk that stops as soon as it passes `end_`. This is a BOUNDED-RANGE
+// primitive (`WHERE rva BETWEEN a AND b`) and a reconnect/resume aid for a dropped bulk
+// pull -- NOT a per-page pagination mechanism: the seek itself is not O(1)/indexed, so
+// reseeking once per page is worse than one linear pull. A single bounded seek pays
+// that cost once, which is fine for an actual range query or an occasional reconnect
+// -- do not repurpose this for OFFSET-style paging of a whole table.
+//
+// The by-address stream interleaves all symbol kinds, so `tag_` is filtered here.
+class SymbolRangeGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    enum SymTagEnum tag_;
+    DWORD start_ = 0;              // inclusive lower bound
+    DWORD end_ = 0xFFFFFFFFu;      // exclusive upper bound (only checked if has_end_)
+    bool has_end_ = false;
+    CComPtr<IDiaEnumSymbolsByAddr> by_addr_;
+    CComPtr<IDiaSymbol> pending_;  // the symbol returned directly by the symbolByRVA seek
+    CachedSymbol current_;
+    int64_t rowid_ = -1;
+    bool started_ = false;
+    bool done_ = false;
+
+public:
+    SymbolRangeGenerator(PdbSession& session, enum SymTagEnum tag, DWORD start, DWORD end, bool has_end)
+        : session_(session), tag_(tag), start_(start), end_(end), has_end_(has_end) {}
+
+    bool next() override {
+        if (done_) return false;
+        if (!started_) {
+            started_ = true;
+            by_addr_ = session_.symbols_by_addr();
+            if (!by_addr_) { done_ = true; return false; }
+            by_addr_->symbolByRVA(start_, &pending_);
+        }
+        for (;;) {
+            CComPtr<IDiaSymbol> symbol;
+            if (pending_) {
+                symbol = pending_;
+                pending_.Release();
+            } else {
+                CComPtr<IDiaSymbol> next_sym;
+                ULONG got = 0;
+                if (FAILED(by_addr_->Next(1, &next_sym, &got)) || got != 1) { done_ = true; return false; }
+                symbol = next_sym;
+            }
+            DWORD rva = 0, tag = 0;
+            symbol->get_relativeVirtualAddress(&rva);
+            symbol->get_symTag(&tag);
+            if (rva < start_) continue;  // symbolByRVA seeks at-or-after start_, but be defensive
+            if (has_end_ && rva >= end_) { done_ = true; return false; }  // past the upper bound: stop
+            if (static_cast<enum SymTagEnum>(tag) != tag_) continue;      // wrong kind, keep walking
+
+            current_ = extract_symbol(symbol);
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// Parses GT/GE/LT/LE constraint args on one rva column into a normalized half-open
+// [start, end) range and builds the SymbolRangeGenerator for it. Saturates on the
+// DWORD range boundary (0xFFFFFFFF) when converting an exclusive bound to inclusive
+// (or vice versa).
+inline std::unique_ptr<xsql::Generator<CachedSymbol>> make_symbol_range_generator(
+        PdbSession& session, enum SymTagEnum tag,
+        const std::vector<xsql::GeneratorConstraintArg>& args) {
+    constexpr DWORD kMaxRva = 0xFFFFFFFFu;
+    auto as_rva = [kMaxRva](const xsql::FunctionArg& v) -> DWORD {
+        int64_t i = v.as_int64();
+        if (i < 0) return 0;
+        if (i > static_cast<int64_t>(kMaxRva)) return kMaxRva;
+        return static_cast<DWORD>(i);
+    };
+    auto saturating_next = [kMaxRva](DWORD rva) { return rva >= kMaxRva ? kMaxRva : rva + 1; };
+
+    DWORD start = 0;
+    DWORD end = kMaxRva;
+    bool has_end = false;
+    for (const auto& arg : args) {
+        const DWORD rva = as_rva(arg.value);
+        switch (arg.op) {
+            case xsql::ConstraintOp::Ge: start = (std::max)(start, rva); break;
+            case xsql::ConstraintOp::Gt: start = (std::max)(start, saturating_next(rva)); break;
+            case xsql::ConstraintOp::Le:
+                end = has_end ? (std::min)(end, saturating_next(rva)) : saturating_next(rva);
+                has_end = true;
+                break;
+            case xsql::ConstraintOp::Lt:
+                end = has_end ? (std::min)(end, rva) : rva;
+                has_end = true;
+                break;
+            default: break;
+        }
+    }
+    return std::make_unique<SymbolRangeGenerator>(session, tag, start, end, has_end);
+}
 
 class CompilandByNameGenerator : public xsql::Generator<CachedCompiland> {
     PdbSession& session_;
@@ -1796,8 +2059,9 @@ public:
 // Functions table
 inline GeneratorTableDef<CachedSymbol> define_functions_table(PdbSession& session) {
     return generator_table<CachedSymbol>("functions")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagFunction)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagFunction); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagFunction)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagFunction, symbol_projection_from(col_used, 2)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_text("undecorated", [](const CachedSymbol& r) { return r.undecorated; })
@@ -1808,11 +2072,44 @@ inline GeneratorTableDef<CachedSymbol> define_functions_table(PdbSession& sessio
         .build();
 }
 
+// symbol_at(addr) — table-valued function returning the innermost symbol of ANY kind
+// CONTAINING an address, via DIA's findSymbolByRVA (cache-free, O(1)). `addr` is a
+// HIDDEN argument, so both the SQLite TVF sugar `SELECT ... FROM symbol_at(0x1234)`
+// and `... FROM symbol_at WHERE addr = 0x1234` work; it returns 0 or 1 row. The `kind`
+// column names the SymTag; `rva`/`length` describe the matched symbol (its start may
+// be <= addr).
+inline GeneratorTableDef<CachedSymbol> define_symbol_at_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("symbol_at")
+        .estimate_rows([]() { return static_cast<size_t>(1); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column_text("undecorated", [](const CachedSymbol& r) { return r.undecorated; })
+        .column_text("kind", [](const CachedSymbol& r) { return std::string(symtag_name(r.symtag)); })
+        .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
+        .column_int("section", [](const CachedSymbol& r) { return static_cast<int>(r.section); })
+        .column_int("offset", [](const CachedSymbol& r) { return static_cast<int>(r.offset); })
+        // Hidden input bound by the positional TVF arg or a WHERE predicate. `rva`
+        // above is the matched symbol's start (may be <= addr); `addr` is the query.
+        .hidden_column_int64("addr")
+        .parametric_filter({"addr"},
+            [&session](const std::vector<xsql::FunctionArg>& args)
+                -> std::unique_ptr<xsql::Generator<CachedSymbol>> {
+                const int64_t addr = args.empty() ? -1 : args[0].as_int64();
+                return std::make_unique<SymbolAtRvaGenerator>(session, addr);
+            },
+            1.0, 1.0)
+        .full_scan_error("symbol_at requires an address: SELECT * FROM symbol_at(0x1234) "
+                         "or SELECT * FROM symbol_at WHERE addr = 0x1234")
+        .build();
+}
+
 // Public symbols table
 inline GeneratorTableDef<CachedSymbol> define_publics_table(PdbSession& session) {
     return generator_table<CachedSymbol>("publics")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagPublicSymbol)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagPublicSymbol); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagPublicSymbol)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagPublicSymbol, symbol_projection_from(col_used, 2)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_text("undecorated", [](const CachedSymbol& r) { return r.undecorated; })
@@ -1826,8 +2123,9 @@ inline GeneratorTableDef<CachedSymbol> define_publics_table(PdbSession& session)
 // Data symbols table
 inline GeneratorTableDef<CachedSymbol> define_data_table(PdbSession& session) {
     return generator_table<CachedSymbol>("data")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagData)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagData); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagData)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagData, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
@@ -1840,8 +2138,9 @@ inline GeneratorTableDef<CachedSymbol> define_data_table(PdbSession& session) {
 // UDT (structs/classes) table
 inline GeneratorTableDef<CachedSymbol> define_udts_table(PdbSession& session) {
     return generator_table<CachedSymbol>("udts")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagUDT)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagUDT); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagUDT)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagUDT, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
@@ -1851,8 +2150,9 @@ inline GeneratorTableDef<CachedSymbol> define_udts_table(PdbSession& session) {
 // Enums table
 inline GeneratorTableDef<CachedSymbol> define_enums_table(PdbSession& session) {
     return generator_table<CachedSymbol>("enums")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagEnum)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagEnum); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagEnum)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagEnum, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
@@ -1862,8 +2162,9 @@ inline GeneratorTableDef<CachedSymbol> define_enums_table(PdbSession& session) {
 // Typedefs table
 inline GeneratorTableDef<CachedSymbol> define_typedefs_table(PdbSession& session) {
     return generator_table<CachedSymbol>("typedefs")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagTypedef)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagTypedef); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagTypedef)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagTypedef, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
@@ -1873,7 +2174,8 @@ inline GeneratorTableDef<CachedSymbol> define_typedefs_table(PdbSession& session
 // Compilands table
 inline GeneratorTableDef<CachedCompiland> define_compilands_table(PdbSession& session) {
     return generator_table<CachedCompiland>("compilands")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagCompiland)); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagCompiland)); })
         .generator([&session]() { return std::make_unique<CompilandGenerator>(session); })
         .column_int64("id", [](const CachedCompiland& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedCompiland& r) { return r.name; })
@@ -1910,12 +2212,18 @@ inline GeneratorTableDef<CachedLineNumber> define_line_numbers_table(PdbSession&
 // Sections table
 inline GeneratorTableDef<CachedSection> define_sections_table(PdbSession& session) {
     return generator_table<CachedSection>("sections")
-        .estimate_rows([]() { return static_cast<size_t>(128); })
+        // PE images have a handful of sections; a small constant is plenty for
+        // the planner (the generator streams the SECTIONHEADERS records directly).
+        .estimate_rows([]() { return static_cast<size_t>(16); })
         .generator([&session]() { return std::make_unique<SectionGenerator>(session); })
         .column_int("number", [](const CachedSection& r) { return static_cast<int>(r.section_number); })
+        .column_text("name", [](const CachedSection& r) { return r.name; })
         .column_int64("rva", [](const CachedSection& r) { return static_cast<int64_t>(r.rva); })
         .column_int("length", [](const CachedSection& r) { return static_cast<int>(r.length); })
-        .column_int("characteristics", [](const CachedSection& r) { return static_cast<int>(r.characteristics); })
+        // characteristics is a DWORD; IMAGE_SCN_MEM_WRITE (0x80000000) sets the high
+        // bit, so a signed int would surface a negative value. Widen to int64 and mask
+        // to 32 bits (matches idasql/ghidra 32-bit-flag exposure).
+        .column_int64("characteristics", [](const CachedSection& r) { return static_cast<int64_t>(r.characteristics) & 0xFFFFFFFFLL; })
         .column_int("readable", [](const CachedSection& r) { return r.read ? 1 : 0; })
         .column_int("writable", [](const CachedSection& r) { return r.write ? 1 : 0; })
         .column_int("executable", [](const CachedSection& r) { return r.execute ? 1 : 0; })
@@ -1926,8 +2234,9 @@ inline GeneratorTableDef<CachedSection> define_sections_table(PdbSession& sessio
 // Thunks table
 inline GeneratorTableDef<CachedSymbol> define_thunks_table(PdbSession& session) {
     return generator_table<CachedSymbol>("thunks")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagThunk)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagThunk); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagThunk)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagThunk, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
@@ -1939,8 +2248,9 @@ inline GeneratorTableDef<CachedSymbol> define_thunks_table(PdbSession& session) 
 // Labels table
 inline GeneratorTableDef<CachedSymbol> define_labels_table(PdbSession& session) {
     return generator_table<CachedSymbol>("labels")
-        .estimate_rows([&session]() { return to_size_t_clamped(session.count_symbols(SymTagLabel)); })
-        .generator([&session]() { return std::make_unique<SymbolGenerator>(session, SymTagLabel); })
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagLabel)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagLabel, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
@@ -2040,6 +2350,7 @@ class TableRegistry {
     GeneratorTableDef<CachedSymbol> typedefs_;
     GeneratorTableDef<CachedSymbol> thunks_;
     GeneratorTableDef<CachedSymbol> labels_;
+    GeneratorTableDef<CachedSymbol> symbol_at_;  // TVF: innermost symbol containing an addr
 
     GeneratorTableDef<CachedCompiland> compilands_;
     GeneratorTableDef<CachedSourceFile> source_files_;
@@ -2053,6 +2364,10 @@ class TableRegistry {
 
     GeneratorTableDef<CachedLocal> locals_;
     GeneratorTableDef<CachedLocal> parameters_;
+
+    // Shared runtime_settings table (query_timeout_ms, timeout_push/pop, ...),
+    // bound to the pdbsql process-wide RuntimeSettingsCore singleton.
+    xsql::CachedTableDef<xsql::runtime::RuntimeSettingEntry> runtime_settings_;
 
     template<typename RowData>
     static void register_one(xsql::Database& db, GeneratorTableDef<RowData>& def) {
@@ -2072,6 +2387,7 @@ public:
         , typedefs_(define_typedefs_table(session_))
         , thunks_(define_thunks_table(session_))
         , labels_(define_labels_table(session_))
+        , symbol_at_(define_symbol_at_table(session_))
         , compilands_(define_compilands_table(session_))
         , source_files_(define_source_files_table(session_))
         , line_numbers_(define_line_numbers_table(session_))
@@ -2081,6 +2397,8 @@ public:
         , base_classes_(define_base_classes_table(session_))
         , locals_(define_locals_table(session_))
         , parameters_(define_parameters_table(session_))
+        , runtime_settings_(xsql::runtime::define_runtime_settings_table(
+              pdbsql::runtime_settings(), "pdbsql"))
     {
         auto* functions_def = &functions_;
         add_filter_eq(functions_, "id",
@@ -2100,6 +2418,28 @@ public:
                                    std::make_unique<SymbolByNameGenerator>(session_, SymTagFunction, name ? name : ""));
                            },
                            5.0, 10.0);
+        // WHERE rva = X: direct DIA address-index lookup (findSymbolByRVA), not a full
+        // walk. Cache-free; cost=1 so the planner strongly prefers it over a scan.
+        add_filter_eq(functions_, "rva",
+                      [functions_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
+                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(functions_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              functions_def,
+                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagFunction));
+                      },
+                      1.0, 1.0);
+        // Bounded WHERE rva > / >= / < / <= X (and BETWEEN, which SQLite expands to a
+        // GE+LE pair): one symbolByRVA seek + a linear walk stopping at the upper
+        // bound. A reconnect/resume aid and a genuine analytical range query -- NOT a
+        // per-page pagination mechanism (see SymbolRangeGenerator's doc comment).
+        add_constraint_range_filter<CachedSymbol>(
+            functions_, "rva",
+            [this](const std::vector<xsql::GeneratorConstraintArg>& args) {
+                return make_symbol_range_generator(session_, SymTagFunction, args);
+            },
+            5.0, 1000.0);
 
         auto* publics_def = &publics_;
         add_filter_eq(publics_, "id",
@@ -2119,6 +2459,22 @@ public:
                                    std::make_unique<SymbolByNameGenerator>(session_, SymTagPublicSymbol, name ? name : ""));
                            },
                            5.0, 10.0);
+        add_filter_eq(publics_, "rva",
+                      [publics_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
+                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(publics_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              publics_def,
+                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagPublicSymbol));
+                      },
+                      1.0, 1.0);
+        add_constraint_range_filter<CachedSymbol>(
+            publics_, "rva",
+            [this](const std::vector<xsql::GeneratorConstraintArg>& args) {
+                return make_symbol_range_generator(session_, SymTagPublicSymbol, args);
+            },
+            5.0, 1000.0);
 
         auto* data_def = &data_;
         add_filter_eq(data_, "id",
@@ -2299,6 +2655,7 @@ public:
         register_one(db, typedefs_);
         register_one(db, thunks_);
         register_one(db, labels_);
+        register_one(db, symbol_at_);
 
         register_one(db, compilands_);
         register_one(db, source_files_);
@@ -2312,6 +2669,9 @@ public:
 
         register_one(db, locals_);
         register_one(db, parameters_);
+
+        db.register_cached_table("runtime_settings", &runtime_settings_);
+        db.create_table("runtime_settings", "runtime_settings");
     }
 };
 

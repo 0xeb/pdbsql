@@ -83,6 +83,29 @@ SELECT name, printf('0x%X', rva) as addr FROM functions WHERE section = 1;
 SELECT * FROM functions WHERE undecorated LIKE '%main%';
 ```
 
+#### symbol_at(addr) — table-valued function
+The innermost symbol of **any** kind **containing** an address (via DIA `findSymbolByRVA`,
+O(1)). Pass the address as `symbol_at(<addr>)` or `WHERE addr = <addr>`; returns 0 or 1
+row. This is the fast addr→symbol primitive for symbolization — unlike `functions WHERE
+rva = X` (exact start only), it resolves any address a symbol spans. See "Indexed lookups".
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `addr` | INT | HIDDEN input — the query address (bound by `symbol_at(<addr>)`) |
+| `id` | INT | Symbol ID |
+| `name` | TEXT | Symbol name (decorated) |
+| `undecorated` | TEXT | Undecorated name |
+| `kind` | TEXT | SymTag: `Function`, `PublicSymbol`, `Data`, `Label`, … |
+| `rva` | INT | Matched symbol's start RVA (may be ≤ `addr`) |
+| `length` | INT | Matched symbol's size in bytes |
+| `section` | INT | PE section number |
+| `offset` | INT | Section offset |
+
+```sql
+-- What symbol is at this address (even mid-function)?
+SELECT name, kind, rva, length FROM symbol_at(0x14002A1F0);
+```
+
 #### publics
 Public symbols (exports, etc.).
 
@@ -322,27 +345,30 @@ FROM line_numbers;
 ### PE Section Tables
 
 #### sections
-PE sections from section contributions.
+PE sections, read from the image's **section headers** — so they resolve even for
+PDBs that expose no section *contributions* (where this table used to return 0 rows).
+Each row is a real named section (`.text`, `.rdata`, `.data`, …).
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `number` | INT | Section number |
+| `number` | INT | Section number (1-based) |
+| `name` | TEXT | Section name (`.text`, `.data`, `.rdata`, …) |
 | `rva` | INT | Section RVA |
 | `length` | INT | Section size |
-| `characteristics` | INT | Section flags |
+| `characteristics` | INT | Section flags (IMAGE_SCN_*, unsigned) |
 | `readable` | INT | 1 if readable |
 | `writable` | INT | 1 if writable |
 | `executable` | INT | 1 if executable |
 | `code` | INT | 1 if code section |
 
 ```sql
--- Code sections
-SELECT number, printf('0x%X', rva) as addr, length
-FROM sections WHERE executable = 1;
+-- All sections with names and attributes
+SELECT number, name, printf('0x%X', rva) AS addr, length, executable, writable
+FROM sections ORDER BY number;
 
--- Data sections
-SELECT number, printf('0x%X', rva) as addr, length
-FROM sections WHERE writable = 1 AND executable = 0;
+-- Code sections
+SELECT number, name, printf('0x%X', rva) AS addr, length
+FROM sections WHERE executable = 1;
 ```
 
 ### Function-Scoped Tables
@@ -395,6 +421,28 @@ SELECT name, type
 FROM parameters
 WHERE func_name = 'MyFunction';
 ```
+
+### runtime_settings (writable — session control)
+
+A small **writable** table of runtime knobs. The one that matters for querying is
+**`query_timeout_ms`** — see *Performance & Fast Paths* below.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key` | TEXT | Setting name (e.g. `query_timeout_ms`) |
+| `value` | TEXT | Current value |
+| `type` | TEXT | `int` / `bool` |
+| `scope` | TEXT | `common` / `action` |
+
+```sql
+-- Read the current query timeout (milliseconds; default 60000)
+SELECT value FROM runtime_settings WHERE key = 'query_timeout_ms';
+
+-- Raise it to 5 minutes for a heavy query (0 = no limit)
+UPDATE runtime_settings SET value = 300000 WHERE key = 'query_timeout_ms';
+```
+
+(The CLI flag `--query-timeout <seconds>` seeds this before a server starts.)
 
 ---
 
@@ -512,40 +560,123 @@ ORDER BY total_size DESC;
 
 ---
 
-## Performance Guidelines
+## Performance & Fast Paths
 
-### Use Equality Filters
+pdbsql reads symbols through Microsoft DIA. A few cost characteristics dominate;
+knowing them lets you pick fast queries and avoid the one slow pattern.
+
+### Counting is cheap — enumerating everything is not
+
+- **`SELECT COUNT(*) FROM <table>` is fast.** It asks DIA for the count directly and
+  never materializes rows — quick even on tables with hundreds of thousands of rows.
+  ```sql
+  SELECT COUNT(*) FROM functions;   -- returns in ~a second, even on a huge PDB
+  ```
+- **A full enumeration with no filter and no LIMIT is inherently slow on large PDBs.**
+  `SELECT name FROM functions` (every row) walks every DIA symbol and can take
+  *minutes* on a big optimized/shipping PDB — that is DIA's per-symbol cost, not a
+  bug. Don't dump a whole large table unless you truly need every row. Prefer:
+  ```sql
+  SELECT name FROM functions LIMIT 100;                         -- explore
+  SELECT name, length FROM udts ORDER BY length DESC LIMIT 20;  -- top-N
+  SELECT * FROM functions WHERE undecorated LIKE '%Init%';      -- filter
+  SELECT COUNT(*) FROM functions;                               -- just the count
+  ```
+- Ordinary filtered / `LIMIT` / top-N queries are cheap to plan and start, even on
+  the biggest tables.
+
+### Indexed lookups & cheap column subsets (best for symbolization)
+
+- **`WHERE rva = <addr>` on `functions`/`publics` is a direct DIA address-index lookup**
+  (findSymbolByRVA) — effectively O(1), not a walk. It is the fast addr→name primitive.
+  `WHERE name = '<exact>'` and `WHERE id = <n>` push down too. Only substring
+  `name LIKE '%...%'` is an unavoidable full walk.
+  ```sql
+  SELECT name FROM functions WHERE rva = 73623824;  -- instant (indexed), not a walk
+  SELECT rva  FROM functions WHERE name = 'CalcHash';
+  ```
+- **`WHERE rva > / >= / < / <= <addr>` on `functions`/`publics` is a BOUNDED range**
+  lookup (one address-index seek + a forward walk that stops at the upper bound) — use
+  it for "what's in this address window", not as a substitute for `LIMIT`/`OFFSET`
+  paging of the whole table. For a full-table pull, use a plain unbounded `SELECT`
+  with `X-XSQL-Stream` (HTTP) or `--dump`/`--format jsonl` (CLI) instead.
+  ```sql
+  SELECT name, rva FROM functions WHERE rva > 0x140010000 AND rva < 0x140020000;
+  ```
+  **Cost is driven by WHERE the window lands, not how wide it is or how many rows
+  it returns.** The seek is not O(1): most windows resolve in single-digit
+  milliseconds regardless of size, but a window landing in an unlucky address
+  region can take 10+ seconds even for a modest window with a normal row count
+  (measured: a 0x10000-byte window returning 1,834 rows took ~14s in one region,
+  vs ~8ms for a similar-sized/row-count window elsewhere) — and it does NOT warm
+  up on repeat, unlike a flat `rva=` lookup. **`X-XSQL-Timeout`/`--query-timeout`/
+  `POST /cancel` cannot bound or abort this**: they are all checked between rows,
+  but the entire cost is paid inside the single seek call before the first row is
+  ever emitted, so there is no row boundary to interrupt at. A stalled range query
+  currently has no recovery short of restarting the server (`POST /shutdown` +
+  relaunch).
+- **`symbol_at(<addr>)` resolves an address INSIDE a symbol → the containing symbol**
+  (of any kind), also via findSymbolByRVA — O(1), the true symbolization primitive.
+  Unlike `WHERE rva = X` (which needs the exact start), `symbol_at` accepts any address
+  the symbol spans and returns 0 or 1 row: `kind` names the SymTag (`Function`,
+  `PublicSymbol`, `Data`, …); `rva`/`length` describe the matched symbol (its start may
+  be ≤ the queried address); an address in a gap returns no row.
+  ```sql
+  SELECT name, kind, rva, length FROM symbol_at(0x14002A1F0);  -- symbol at an address
+  SELECT name FROM symbol_at(0x14002A1F0) WHERE kind = 'Function';
+  -- SELECT * FROM symbol_at WHERE addr = 0x14002A1F0;  -- equivalent explicit form
+  ```
+- **Select only the columns you need.** `undecorated` (the demangled name) is by far the
+  most expensive field. A `SELECT name, rva, length …` pull skips the demangle and is
+  dramatically cheaper than one that includes `undecorated`; add `undecorated` only when
+  you actually need demangled names.
+
+### Queries are time-bounded (you may get partial results)
+
+The server and CLI abort a query that exceeds `query_timeout_ms` (default **60 s**)
+and return the rows gathered so far **plus a "results are partial" warning** — a
+runaway query can no longer hang the tool. Tune it per query via `runtime_settings`
+(above) or start a server with `--query-timeout <seconds>` (`0` = no limit). If a
+result comes back partial, add a `LIMIT`/`WHERE`, or raise the timeout deliberately.
+Over HTTP you can bound a single request with the header `X-XSQL-Timeout: <ms>`
+(`0` = no limit), independent of the server default. To stop an **already-running**
+query, send `POST /cancel` from another connection — the in-flight query returns its
+partial rows; a client that drops a streamed connection mid-flight cancels it too.
+
+### Use equality filters and bounded output
 
 ```sql
--- FAST: Uses constraint pushdown
+-- FAST: constraint pushdown on a scoped table
 SELECT * FROM locals WHERE func_id = 12345;
-
--- SLOW: Full scan
+-- SLOW: full scan by an unindexed text column
 SELECT * FROM locals WHERE func_name LIKE '%main%';
-```
 
-### Limit Result Sets
-
-```sql
--- Use LIMIT for exploration
-SELECT * FROM functions LIMIT 100;
-
--- Combine with ORDER BY for top-N
-SELECT name, length FROM functions ORDER BY length DESC LIMIT 10;
-```
-
-### Index-Friendly Queries
-
-```sql
--- Exact matches are fastest
+-- Exact match fastest; leading-wildcard LIKE slowest
 SELECT * FROM udts WHERE name = 'MyStruct';
-
--- LIKE with leading wildcard is slowest
-SELECT * FROM udts WHERE name LIKE '%Struct%';
-
--- LIKE without leading wildcard is faster
-SELECT * FROM udts WHERE name LIKE 'My%';
+SELECT * FROM udts WHERE name LIKE 'My%';      -- ok (anchored)
+SELECT * FROM udts WHERE name LIKE '%Struct%'; -- slowest (leading wildcard)
 ```
+
+Always filter function-scoped tables (`locals`, `parameters`) by `func_id`.
+
+### Large results: stream over HTTP, or export from the CLI
+
+Over HTTP, add `X-XSQL-Stream: 1` to `POST /query` to stream the result row-by-row
+(chunked): peak memory stays ~one row and the first bytes arrive immediately — use a
+client that does NOT buffer the whole response (e.g. `curl -N`). The wire format is the
+same JSON envelope, emitted incrementally. Use `X-XSQL-Stream: ndjson` instead for
+newline-delimited JSON — one self-describing object per row per line, ideal for a client
+that appends rows to a file as they arrive.
+
+For a one-time **bulk export**, the CLI is simplest: it writes straight to disk with no
+HTTP framing, no padded table, and is column-aware (no demangle unless `undecorated` is
+selected). Select the columns you need — this is the fast path (`--format tsv|csv|jsonl`):
+```bash
+pdbsql app.pdb -q "SELECT name,rva,length FROM functions" --format jsonl -o funcs.jsonl --query-timeout 0 --quiet
+pdbsql app.pdb -q "SELECT name,rva,length FROM functions" --format tsv   -o funcs.tsv   --query-timeout 0
+```
+`--dump <table>` is a `SELECT * FROM <table>` shortcut — handy, but for `functions`/`publics`
+it pulls the expensive `undecorated` column, so prefer explicit columns for a fast bulk pull.
 
 ---
 
@@ -754,7 +885,7 @@ ORDER BY u.name;
 
 ## Server Modes
 
-PDBSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
+PDBSQL runs two server modes: **HTTP REST** (`--http`, recommended for scripts/agents) and **MCP** (`--mcp`, for MCP clients).
 
 ---
 
@@ -764,14 +895,20 @@ Standard REST API that works with curl, any HTTP client, or LLM tools.
 
 **Starting the server:**
 ```bash
-# Default port 8081
+# HTTP REST, default port 8080
 pdbsql database.pdb --http
 
 # Custom port and bind address
 pdbsql database.pdb --http 9000 --bind 0.0.0.0
 
-# With authentication
-pdbsql database.pdb --http 8081 --token mysecret
+# With authentication (HTTP only; the MCP endpoint is unauthenticated)
+pdbsql database.pdb --http 8080 --token mysecret
+
+# Bound query timeout (seconds; 0 = no limit; default 60) — seeds runtime_settings
+pdbsql database.pdb --http 8080 --query-timeout 120
+
+# MCP server (default: random port 9000-9999)
+pdbsql database.pdb --mcp
 ```
 
 **HTTP Endpoints:**
@@ -781,34 +918,40 @@ pdbsql database.pdb --http 8081 --token mysecret
 | `/` | GET | No | Welcome message |
 | `/help` | GET | No | API documentation (for LLM discovery) |
 | `/query` | POST | Yes* | Execute SQL (body = raw SQL) |
-| `/status` | GET | Yes* | Health check |
+| `/status` | GET | No | Health check — O(1) liveness (no symbol scan; can't hang), always unauthenticated so uptime/LB probes work even with `--token` set |
 | `/shutdown` | POST | Yes* | Stop server |
 
-*Auth required only if `--token` was specified.
+*Auth required only if `--token` was specified (`/help` and `/status` are always exempt).
 
 **Example with curl:**
 ```bash
 # Get API documentation
-curl http://localhost:8081/help
+curl http://localhost:8080/help
 
 # Execute SQL query
-curl -X POST http://localhost:8081/query -d "SELECT name, rva FROM functions LIMIT 5"
+curl -X POST http://localhost:8080/query -d "SELECT name, rva FROM functions LIMIT 5"
 
 # With authentication
-curl -X POST http://localhost:8081/query \
+curl -X POST http://localhost:8080/query \
      -H "Authorization: Bearer mysecret" \
      -d "SELECT * FROM udts"
 
 # Check status
-curl http://localhost:8081/status
+curl http://localhost:8080/status
 ```
 
-**Response Format (JSON):**
+**Response Format (JSON).** Each response is a multi-statement envelope; results are
+under `results[]`, one entry per statement:
 ```json
-{"success": true, "columns": ["name", "rva"], "rows": [["main", "4096"]], "row_count": 1}
+{"success": true, "statement_count": 1,
+ "results": [{"statement_index": 0, "success": true,
+              "columns": ["name", "rva"], "rows": [["main", "4096"]],
+              "row_count": 1, "elapsed_ms": 0.1, "error": null}],
+ "row_count_total": 1, "elapsed_ms_total": 0.1, "first_error_index": null}
 ```
+On error, the failing statement carries `"success": false` and an `"error"` string.
+A query that hits the timeout returns `"success": true` with the **partial** rows.
 
-```json
-{"success": false, "error": "no such table: bad_table"}
-```
+**Low-memory streaming:** add the header `X-XSQL-Stream: 1` to the `POST /query` and
+the same envelope is streamed row-by-row (chunked), keeping peak memory at ~one row.
 

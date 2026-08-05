@@ -16,7 +16,7 @@
  *   pdbsql <pdb_file> --mcp [port]         Start MCP server mode
  */
 
-#include "table_printer.hpp"
+#include "cli_render.hpp"
 #include "query_json.hpp"
 #ifdef PDBSQL_HAS_HTTP
 #include "http_mode.hpp"
@@ -27,6 +27,7 @@
 
 #include "pdb_session.hpp"
 #include "pdb_tables.hpp"
+#include "pdb_runtime_settings.hpp"
 
 #include <xsql/database.hpp>
 
@@ -36,7 +37,6 @@
 #include <string>
 #include <iostream>
 #include <vector>
-#include <algorithm>
 #include <csignal>
 #include <atomic>
 #include <sstream>
@@ -54,29 +54,61 @@ static bool parse_port(const std::string &s, int &port) {
 // Local helpers
 //=============================================================================
 
-static TablePrinter* g_printer = nullptr;
+// Machine-readable / file output options for the local query path.
+struct OutputOptions {
+    std::string format = "boxed";  // boxed (terminal table) | tsv | csv
+    std::string file;              // empty => stdout
+};
 
-static int table_callback(void*, int argc, char** argv, char** colNames) {
-    if (g_printer) {
-        g_printer->add_row(argc, argv, colNames);
-    }
-    return 0;
-}
+// Run a query through the shared libxsql script path (which threads the
+// runtime_settings query timeout, exactly like the HTTP/MCP servers) and render the
+// result in the requested format to stdout or a file. Replaces the old db.exec +
+// bespoke TablePrinter path, whose db.exec callback had no timeout hook.
+static bool execute_query(xsql::Database& db, const char* sql,
+                          const OutputOptions& out = {}) {
+    xsql::ScriptOptions sopts;
+    sopts.timeout_ms = pdbsql::runtime_settings().query_timeout_ms();
 
-static bool execute_query(xsql::Database& db, const char* sql) {
-    TablePrinter printer;
-    g_printer = &printer;
+    xsql::ScriptResult script = pdbsql::run_pdbsql_script(db, sql, sopts);
 
-    int rc = db.exec(sql, table_callback, nullptr);
-    g_printer = nullptr;
-
-    if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", db.last_error().c_str());
+    if (!script.parse_error.empty()) {
+        fprintf(stderr, "SQL error: %s\n", script.parse_error.c_str());
         return false;
     }
 
-    printer.print();
-    return true;
+    bool ok = true;
+    for (const auto& stmt : script.results) {
+        if (!stmt.success) {
+            // Same contract as before: error on stderr.
+            fprintf(stderr, "SQL error: %s\n", stmt.error.c_str());
+            ok = false;
+        }
+    }
+
+    const std::string body = pdbsql::format_script_result(script, out.format);
+    if (!out.file.empty()) {
+        FILE* fp = fopen(out.file.c_str(), "wb");
+        if (!fp) {
+            fprintf(stderr, "Error: cannot open output file: %s\n", out.file.c_str());
+            return false;
+        }
+        if (!body.empty()) fwrite(body.data(), 1, body.size(), fp);
+        fclose(fp);
+        fprintf(stderr, "Wrote %zu bytes to %s\n", body.size(), out.file.c_str());
+    } else {
+        std::cout << body;
+    }
+
+    // Surface partial/timeout/warnings on stderr — never pollutes the data.
+    for (const auto& stmt : script.results) {
+        for (const auto& w : stmt.warnings) {
+            fprintf(stderr, "Warning: %s\n", w.c_str());
+        }
+        if (stmt.timed_out) {
+            fprintf(stderr, "Warning: query timed out; results are partial\n");
+        }
+    }
+    return ok;
 }
 
 //=============================================================================
@@ -101,6 +133,7 @@ static void print_usage(const char* prog) {
 #ifdef PDBSQL_HAS_HTTP
     printf("  %s <pdb_file> --http [port]          Start HTTP REST server (default: 8080)\n", prog);
     printf("  %s <pdb_file> --bind <addr>          Bind address for server (default: 127.0.0.1)\n", prog);
+    printf("  %s --query-timeout <sec>             Seed runtime_settings.query_timeout_ms for the servers (0 = no limit; default 60)\n", prog);
 #endif
 #ifdef PDBSQL_HAS_MCP
     printf("  %s <pdb_file> --mcp [port]           Start MCP server (default: random 9000-9999)\n", prog);
@@ -190,6 +223,11 @@ int main(int argc, char* argv[]) {
     int http_port = 8080;
     bool mcp_mode = false;
     int mcp_port = 0;  // 0 = random port in 9000-9999
+    int query_timeout_sec = -1;  // -1 = flag not given (keep runtime_settings default)
+    std::string output_format = "boxed";  // boxed | tsv | csv
+    std::string output_file;              // -o/--output; empty => stdout
+    bool quiet = false;                   // --quiet suppresses the banner
+    std::string dump_table;               // --dump <table> => SELECT * FROM <table>
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -224,6 +262,31 @@ int main(int argc, char* argv[]) {
             }
         } else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) {
             bind_addr = argv[++i];
+        } else if (strcmp(argv[i], "--query-timeout") == 0 && i + 1 < argc) {
+            // strtol, not atoi: atoi("abc") is 0 (silently disables the cap and the
+            // <0 guard never fires). Reject non-numeric/trailing garbage and cap at
+            // the same one-hour ceiling enforced by RuntimeSettingsCore.
+            const char* tv = argv[++i];
+            char* tend = nullptr;
+            long tsec = strtol(tv, &tend, 10);
+            if (tend == tv || *tend != '\0' || tsec < 0 || tsec > 3600) {
+                fprintf(stderr, "Invalid query timeout (expected 0..3600 seconds): %s\n", tv);
+                return 1;
+            }
+            query_timeout_sec = static_cast<int>(tsec);
+        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            output_format = argv[++i];
+            if (output_format != "boxed" && output_format != "tsv" && output_format != "csv" &&
+                output_format != "jsonl") {
+                fprintf(stderr, "Invalid --format (expected boxed|tsv|csv|jsonl): %s\n", output_format.c_str());
+                return 1;
+            }
+        } else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
+            output_file = argv[++i];
+        } else if (strcmp(argv[i], "--quiet") == 0) {
+            quiet = true;
+        } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
+            dump_table = argv[++i];
         } else if ((strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--source") == 0) && i + 1 < argc) {
             pdb_path = argv[++i];
         } else if (pdb_path.empty() && argv[i][0] != '-') {
@@ -244,6 +307,18 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: PDB path required\n\n");
         print_usage(argv[0]);
         return 1;
+    }
+
+    // --query-timeout is a startup override that seeds the shared
+    // runtime_settings.query_timeout_ms (the HTTP/MCP servers read it per query).
+    // Omitted => the family default (60000 ms); `--query-timeout 0` disables the
+    // cap for a known-big dump. Runtime changes go through
+    // `UPDATE runtime_settings` / `PRAGMA pdbsql.timeout_push`.
+    if (query_timeout_sec >= 0) {
+        if (!pdbsql::runtime_settings().set_query_timeout_ms(query_timeout_sec * 1000)) {
+            fprintf(stderr, "Invalid query timeout: %d seconds\n", query_timeout_sec);
+            return 1;
+        }
     }
 
 #ifdef PDBSQL_HAS_HTTP
@@ -278,15 +353,36 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    printf("pdbsql - Loaded: %s\n", pdb_path.c_str());
-    printf("%s\n\n", g_copyright);
+    // Banner on stderr (never stdout) so piped / `-o` output stays clean; --quiet drops it.
+    if (!quiet) {
+        fprintf(stderr, "pdbsql - Loaded: %s\n%s\n\n", pdb_path.c_str(), g_copyright);
+    }
 
     xsql::Database db;
     pdbsql::TableRegistry registry(session);
     registry.register_all(db);
 
+    // --dump <table> is sugar for "SELECT * FROM <table>" (pair with --format/-o for a
+    // machine-readable bulk export; use --query-timeout 0 for a full unbounded dump).
+    if (!dump_table.empty()) {
+        bool valid = true;
+        for (char c : dump_table) {
+            const bool ok_char = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                 (c >= '0' && c <= '9') || c == '_';
+            if (!ok_char) { valid = false; break; }
+        }
+        if (!valid) {
+            fprintf(stderr, "Invalid --dump table name: %s\n", dump_table.c_str());
+            return 1;
+        }
+        query = "SELECT * FROM " + dump_table;
+    }
+
+    OutputOptions out_opts{output_format, output_file};
     if (!query.empty()) {
-        execute_query(db, query.c_str());
+        if (!execute_query(db, query.c_str(), out_opts)) {
+            return 1;
+        }
     } else if (interactive) {
         interactive_mode(db);
     } else {

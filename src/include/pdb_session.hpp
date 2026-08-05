@@ -120,7 +120,37 @@ public:
         return result;
     }
 
-    // Get symbol count for a type
+    // Find the symbol at an RVA via DIA's native address index (findSymbolByRVA).
+    // Cache-free: DIA owns the index, so this is a direct lookup, not a full walk.
+    // findSymbolByRVA is containment-based (returns the symbol whose range contains
+    // rva, which may start earlier), so a caller needing exact-start `WHERE rva = X`
+    // semantics must confirm the returned symbol's RVA.
+    CComPtr<IDiaSymbol> find_symbol_by_rva(DWORD rva, enum SymTagEnum symtag = SymTagNull) {
+        CComPtr<IDiaSymbol> result;
+        if (session_) {
+            session_->findSymbolByRVA(rva, symtag, &result);
+        }
+        return result;
+    }
+
+    // Address-ordered symbol enumerator (all symbol kinds, by RVA). Used for a
+    // BOUNDED range predicate (`WHERE rva BETWEEN a AND b`): the caller seeks with
+    // symbolByRVA(start) -- which returns the symbol AT-OR-AFTER start directly, not
+    // just positioning the cursor -- then walks forward with Next() until past the
+    // upper bound. The seek itself is not O(1)/indexed, so this is meant for a single
+    // bounded query or an occasional reconnect, not repeated per-page seeking.
+    CComPtr<IDiaEnumSymbolsByAddr> symbols_by_addr() {
+        CComPtr<IDiaEnumSymbolsByAddr> by_addr;
+        if (session_) session_->getSymbolsByAddr(&by_addr);
+        return by_addr;
+    }
+
+    // Get symbol count for a type. Delegates straight to DIA's enumerator count
+    // (get_Count) — fast, and DIA already caches internally. pdbsql keeps NO
+    // symbol-count cache of its own: libxsql's rule is no persistent caches (a
+    // per-query scope at most), and a session-lifetime cache here would just
+    // duplicate DIA. This is the exact count SELECT COUNT(*) resolves via the
+    // COUNT_ONLY_SCAN fast path, and it never materializes rows.
     LONG count_symbols(enum SymTagEnum symtag) {
         auto symbols = enum_symbols(symtag);
         if (!symbols) return 0;

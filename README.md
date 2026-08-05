@@ -31,6 +31,7 @@ No SDK. No scripting runtime. Just SQL.
 | Table | What's in it |
 |-------|--------------|
 | `functions` | All functions with name, RVA, size, signature |
+| `symbol_at(addr)` | TVF: innermost symbol *containing* an address (fast addr→symbol) |
 | `publics` | Public symbols (exports, decorated names) |
 | `udts` | Structs, classes, unions with size and member count |
 | `udt_members` | Fields: offset, type, bit position |
@@ -67,6 +68,22 @@ build\bin\Release\pdbsql.exe your_file.pdb -i
 pdbsql test.pdb "SELECT name FROM functions WHERE length > 500"
 ```
 
+**Machine-readable output / bulk export:**
+```bash
+# TSV/CSV to stdout (the banner goes to stderr, so pipes stay clean)
+pdbsql test.pdb -q "SELECT name,rva,length FROM functions LIMIT 100" --format tsv
+
+# One-shot bulk export to disk (no HTTP, no padded table, column-aware).
+# --format tsv|csv|jsonl; pick explicit columns for the fast path (no demangle).
+pdbsql test.pdb -q "SELECT name,rva,length FROM functions" --format jsonl -o funcs.jsonl --query-timeout 0 --quiet
+# --dump <table> is sugar for "SELECT * FROM <table>" (handy, but for functions it
+# pulls the expensive undecorated column, so prefer explicit columns for a fast pull).
+pdbsql test.pdb --dump sections --format csv -o sections.csv --quiet
+```
+`WHERE rva = <addr>` and `WHERE name = '<exact>'` are indexed lookups (fast addr→name);
+only substring `name LIKE '%…%'` is a full walk. Selecting `undecorated` (the demangled
+name) is the one expensive column — omit it for a fast bulk pull.
+
 **Interactive mode:**
 ```bash
 pdbsql test.pdb -i
@@ -82,8 +99,59 @@ pdbsql test.pdb --http 8080 --token secret123
 
 # Terminal 2: Query over HTTP
 curl -X POST http://localhost:8080/query -H "Authorization: Bearer secret123" -d "SELECT * FROM sections"
+
+# Stream a large result row-by-row (chunked, flat memory, early first byte).
+# Use curl -N so the client does not buffer the whole response.
+curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: 1" -d "SELECT name FROM publics"
+
+# Bound a single request (ms; 0 = no limit), independent of the server default
+curl -X POST http://localhost:8080/query -H "X-XSQL-Timeout: 5000" -d "SELECT name,rva FROM functions"
+
+# NDJSON stream: one JSON object per row per line (append rows to a file as they arrive)
+curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: ndjson" -d "SELECT name,rva FROM functions"
+```
+
+**Streaming: verified, and its actual tradeoff.** Measured with `curl -N -w
+"%{time_starttransfer} %{time_total}"` on a large (multi-gigabyte, million-symbol)
+PDB: streamed NDJSON delivers the **first byte in a few milliseconds**, regardless of
+result size (vs the buffered response, which only replies once the whole query
+finishes) — the low-memory, early-first-byte guarantee holds. But **total wall-clock
+to receive everything was noticeably higher streamed than buffered** in that same
+test — chunked per-row delivery has real per-write overhead a single buffered
+response doesn't pay. Use streaming when you want to start processing rows
+immediately or keep server/client memory flat on a huge pull; use the plain buffered
+response when the result comfortably fits in memory and you just want it as fast as
+possible. `curl -s` (without `-N`) will report the buffered response's timing even
+with `X-XSQL-Stream` set, because `curl` itself buffers output without `-N` — always
+use `-N` to observe real streaming behavior client-side.
+
+**Bounded address-range queries** (`WHERE rva > X AND rva < Y` on `functions`/
+`publics`) are index-backed but not O(1): cost depends on *where* the window lands,
+not its width or row count — most windows resolve in single-digit milliseconds, but
+one landing in an unlucky address region can take 10+ seconds (measured: a
+0x10000-byte window returning ~1,800 rows took ~14s in one region vs ~8ms for a
+similar window elsewhere), and it does not warm up on repeat. `X-XSQL-Timeout` and
+`POST /cancel` cannot bound or abort a stalled range query — the entire cost is paid
+inside a single call before the first row is emitted, so there's no row boundary to
+interrupt at; a stall's only recovery is restarting the server. Use range queries for
+a known address window, not as a general-purpose scan.
+
+```bash
+# Cancel the in-flight query from another connection (it returns its partial rows)
+curl -X POST http://localhost:8080/cancel -H "Authorization: Bearer secret123"
+
+# Change the per-query timeout at runtime (default 60000 ms; 0 = no limit)
+curl -X POST http://localhost:8080/query -d "UPDATE runtime_settings SET value='30000' WHERE key='query_timeout_ms'"
+
+# ...or seed it at startup (--query-timeout 0 disables the cap for a known-big dump)
+pdbsql test.pdb --http 8080 --query-timeout 30
 ```
 > **Note:** `--token` guards the HTTP API only; the MCP endpoint (`--mcp`) is unauthenticated.
+>
+> The HTTP and MCP servers honor `runtime_settings.query_timeout_ms` (default 60 s)
+> per query — `SELECT/UPDATE runtime_settings` to inspect or change it. `--query-timeout`
+> is a convenience that seeds the same setting at launch. `/status` is a cheap liveness
+> check that never enumerates symbols, so it stays instant on very large PDBs.
 
 **MCP server mode** (Model Context Protocol, for MCP clients):
 ```bash
@@ -111,10 +179,8 @@ tool two ways:
 
 **Triage a crash dump:**
 ```sql
--- Find function at crash address
-SELECT name, rva, rva + length as end_rva
-FROM functions
-WHERE rva <= 0x12345 AND rva + length > 0x12345;
+-- Symbol at the crash address — O(1) containment lookup (any kind), not a full scan
+SELECT name, kind, rva, length FROM symbol_at(0x12345);
 ```
 
 **Understand binary structure:**
@@ -122,8 +188,8 @@ WHERE rva <= 0x12345 AND rva + length > 0x12345;
 -- Largest functions (complexity indicators)
 SELECT name, length FROM functions ORDER BY length DESC LIMIT 20;
 
--- Executable sections with their sizes and flags
-SELECT number, rva, length, characteristics, readable, writable, executable FROM sections;
+-- Executable sections with their names, sizes and flags
+SELECT number, name, rva, length, characteristics, readable, writable, executable FROM sections;
 ```
 
 **Reverse engineering prep:**

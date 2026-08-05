@@ -43,9 +43,12 @@ int run_mcp_mode(const std::string& pdb_path, int port, const std::string& bind_
 
     std::string actual_bind = bind_addr.empty() ? "127.0.0.1" : bind_addr;
 
-    // Direct-SQL executor (returns the canonical JSON envelope for MCP)
+    // Direct-SQL executor (returns the canonical JSON envelope for MCP). Honors
+    // the shared runtime_settings.query_timeout_ms (read fresh per call).
     pdbsql::QueryCallback sql_cb = [&db](const std::string& sql) -> std::string {
-        return query_result_to_json(db, sql);
+        xsql::ScriptOptions sopts;
+        sopts.timeout_ms = pdbsql::runtime_settings().query_timeout_ms();
+        return query_result_to_json(db, sql, sopts);
     };
 
     pdbsql::PdbsqlMCPServer mcp_server;
