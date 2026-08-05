@@ -17,18 +17,24 @@ concurrency:
 
 jobs:
   # ============================================================================
-  # Build (Windows x64 + x86 - requires MSDIA)
+  # Build (Windows x64 + x86 + ARM64 - requires MSDIA)
   # ============================================================================
   build:
     name: Build (${{ matrix.arch }})
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x64
             cmake_arch: x64
+            runner: windows-latest
           - arch: x86
             cmake_arch: Win32
+            runner: windows-latest
+          - arch: arm64
+            cmake_arch: ARM64
+            runner: windows-11-arm
 
     steps:
       - name: Checkout
@@ -94,10 +100,17 @@ jobs:
           name: pdbsql-windows-x86
           path: pdbsql-windows-x86
 
+      - name: Download arm64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pdbsql-windows-arm64
+          path: pdbsql-windows-arm64
+
       - name: Package release
         run: |
           zip -r pdbsql-windows-x64.zip pdbsql-windows-x64/
           zip -r pdbsql-windows-x86.zip pdbsql-windows-x86/
+          zip -r pdbsql-windows-arm64.zip pdbsql-windows-arm64/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -105,4 +118,5 @@ jobs:
           files: |
             pdbsql-windows-x64.zip
             pdbsql-windows-x86.zip
+            pdbsql-windows-arm64.zip
           generate_release_notes: true

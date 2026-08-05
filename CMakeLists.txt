@@ -66,9 +66,14 @@ endif()
 
 message(STATUS "Found DIA SDK: ${DIA_SDK_DIR}")
 
-# DIA SDK include/lib
+# DIA SDK include/lib. ARM64 is also a 64-bit pointer target, so it must be
+# checked before the generic CMAKE_SIZEOF_VOID_P==8 case -- otherwise an
+# ARM64 configure would silently link the x64 (amd64) import lib, a machine-
+# type mismatch at link time.
 set(DIA_INCLUDE_DIR "${DIA_SDK_DIR}/include")
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64" OR CMAKE_VS_PLATFORM_NAME STREQUAL "ARM64")
+    set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib/arm64")
+elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib/amd64")
 else()
     set(DIA_LIB_DIR "${DIA_SDK_DIR}/lib")
