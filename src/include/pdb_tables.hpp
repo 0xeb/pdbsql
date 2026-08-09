@@ -40,7 +40,9 @@
 #include <algorithm>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 
 namespace pdbsql {
@@ -71,7 +73,8 @@ struct CachedCompiland {
     std::string name;
     std::string library_name;
     std::string source_file;
-    DWORD language = 0;  // CV_CFL_C, CV_CFL_CXX, etc.
+    DWORD language = 0;          // CV_CFL_C, CV_CFL_CXX, etc. -- only meaningful when
+    bool has_language = false;   // has_language; not every compiland reports one.
 };
 
 struct CachedSourceFile {
@@ -113,6 +116,11 @@ struct CachedMember {
     DWORD access = 0;  // 1=private, 2=protected, 3=public
     bool is_static = false;
     bool is_virtual = false;
+    bool is_pure = false;
+    // Data members and member functions are both UDT children, distinguished here
+    // so `offset` (data-only) can report NULL on function rows and callers can
+    // restrict to the historical data-only view with `WHERE kind = 'data'`.
+    bool is_function = false;
 };
 
 struct CachedEnumValue {
@@ -140,7 +148,17 @@ struct CachedLocal {
     std::string name;
     std::string type_name;
     DWORD location_type = 0;
-    int64_t offset_or_register = 0;
+    // A single offset_or_register column meant different things depending on
+    // location_type, so a reader had to consult a sibling column to know what the
+    // number was. Split: each is set only when it applies, NULL otherwise.
+    bool has_frame_offset = false;
+    int64_t frame_offset = 0;
+    bool has_register = false;
+    int64_t register_id = 0;
+    // Source order of a parameter. DIA emits children in order, but SQL promises
+    // no row order without ORDER BY, so a signature could not be reconstructed
+    // reliably without this.
+    int64_t ordinal = 0;
 };
 
 // ============================================================================
@@ -170,6 +188,120 @@ inline std::string safe_symbol_name(IDiaSymbol* symbol) {
         return name.str();
     }
     return "";
+}
+
+// CV basic-type code -> C++ spelling. The width matters: DIA reports `int`,
+// `short` and `__int64` all as bt=6 (btInt), distinguished only by length.
+inline std::string base_type_spelling(DWORD base_type, ULONGLONG length) {
+    switch (base_type) {
+        case btVoid:    return "void";
+        case btChar:    return "char";
+        case btWChar:   return "wchar_t";
+        case btInt:
+            switch (length) {
+                case 1:  return "signed char";
+                case 2:  return "short";
+                case 8:  return "__int64";
+                default: return "int";
+            }
+        case btUInt:
+            switch (length) {
+                case 1:  return "unsigned char";
+                case 2:  return "unsigned short";
+                case 8:  return "unsigned __int64";
+                default: return "unsigned int";
+            }
+        case btFloat:   return length == 4 ? "float" : "double";
+        case btBool:    return "bool";
+        case btLong:    return "long";
+        case btULong:   return "unsigned long";
+        case btBSTR:    return "BSTR";
+        case btHresult: return "HRESULT";
+        case btCurrency:return "CURRENCY";
+        case btDate:    return "DATE";
+        case btVariant: return "VARIANT";
+        case btComplex: return "complex";
+        case btBit:     return "bit";
+        case btChar16:  return "char16_t";
+        case btChar32:  return "char32_t";
+        case btNoType:  return "";
+        default:        return "";
+    }
+}
+
+// Render a readable type name for ANY type symbol.
+//
+// A bare get_name() only works for named types (UDT/enum/typedef). Basic types,
+// pointers, arrays and function types have NO name in DIA, so get_name() returns
+// an empty string for them -- which is why most `parameters.type` values used to
+// come back blank. Building the name structurally fixes all of them.
+inline std::string type_name_of(IDiaSymbol* type, int depth = 0) {
+    if (!type || depth > 8) return "";
+
+    DWORD tag = 0;
+    if (FAILED(type->get_symTag(&tag))) return "";
+
+    auto cv_prefix = [&](IDiaSymbol* s) {
+        std::string p;
+        BOOL f = FALSE;
+        if (SUCCEEDED(s->get_constType(&f)) && f) p += "const ";
+        if (SUCCEEDED(s->get_volatileType(&f)) && f) p += "volatile ";
+        return p;
+    };
+
+    switch (tag) {
+        case SymTagBaseType: {
+            DWORD bt = 0;
+            ULONGLONG len = 0;
+            type->get_baseType(&bt);
+            type->get_length(&len);
+            return cv_prefix(type) + base_type_spelling(bt, len);
+        }
+        case SymTagPointerType: {
+            CComPtr<IDiaSymbol> inner;
+            type->get_type(&inner);
+            BOOL is_ref = FALSE;
+            type->get_reference(&is_ref);
+            // A pointer's own const/volatile is TOP-LEVEL cv ("char * const") and
+            // belongs after the star; the pointee's cv already comes back inside
+            // the recursive call. Prefixing here yields "const const char*".
+            std::string suffix;
+            BOOL f = FALSE;
+            if (SUCCEEDED(type->get_constType(&f)) && f) suffix += " const";
+            if (SUCCEEDED(type->get_volatileType(&f)) && f) suffix += " volatile";
+            return type_name_of(inner, depth + 1) + (is_ref ? "&" : "*") + suffix;
+        }
+        case SymTagArrayType: {
+            CComPtr<IDiaSymbol> inner;
+            type->get_type(&inner);
+            DWORD count = 0;
+            type->get_count(&count);
+            return cv_prefix(type) + type_name_of(inner, depth + 1) + "[" + std::to_string(count) + "]";
+        }
+        case SymTagFunctionType: {
+            CComPtr<IDiaSymbol> ret;
+            type->get_type(&ret);
+            std::string out = type_name_of(ret, depth + 1) + " (";
+            CComPtr<IDiaEnumSymbols> args;
+            bool first = true;
+            if (SUCCEEDED(type->findChildren(SymTagFunctionArgType, nullptr, nsNone, &args)) && args) {
+                for (;;) {
+                    CComPtr<IDiaSymbol> arg;
+                    ULONG fetched = 0;
+                    if (FAILED(args->Next(1, &arg, &fetched)) || fetched != 1) break;
+                    CComPtr<IDiaSymbol> arg_type;
+                    arg->get_type(&arg_type);
+                    if (!first) out += ", ";
+                    out += type_name_of(arg_type, depth + 1);
+                    first = false;
+                }
+            }
+            if (first) out += "void";
+            return out + ")";
+        }
+        default:
+            return cv_prefix(type) + safe_symbol_name(type);
+    }
 }
 
 // Which expensive per-symbol fields to materialize. Driven by SQLite's colUsed so a
@@ -214,6 +346,19 @@ inline CachedSymbol extract_symbol(IDiaSymbol* symbol, SymbolProjection proj = {
     symbol->get_length(&cs.length);
     symbol->get_symTag(&cs.symtag);
 
+    // A data symbol carries no length of its own -- its size is a property of its
+    // TYPE, so get_length leaves 0 and `ORDER BY length` over `data` was
+    // meaningless. Scoped to SymTagData so the hot functions/publics scan path
+    // keeps its single get_length call. A residual 0 here is a genuine 0 (e.g. the
+    // zero-length CRT section-boundary arrays __xc_a/__xc_z).
+    if (cs.length == 0 && cs.symtag == SymTagData) {
+        CComPtr<IDiaSymbol> type;
+        if (SUCCEEDED(symbol->get_type(&type)) && type) {
+            ULONGLONG type_len = 0;
+            if (SUCCEEDED(type->get_length(&type_len))) cs.length = type_len;
+        }
+    }
+
     DWORD section = 0, offset = 0;
     symbol->get_addressSection(&section);
     symbol->get_addressOffset(&offset);
@@ -223,19 +368,83 @@ inline CachedSymbol extract_symbol(IDiaSymbol* symbol, SymbolProjection proj = {
     return cs;
 }
 
+// Fill a udt_members row from one UDT child. `is_function` selects the member
+// FUNCTION reading (virtual/pure/isStatic, no meaningful offset) over the data
+// member reading (offset + type length, static via location). Shared by all three
+// udt_members generators so the scan and the two pushdown paths cannot drift.
+inline CachedMember extract_member(IDiaSymbol* member,
+                                   bool is_function,
+                                   DWORD parent_id,
+                                   const std::string& parent_name) {
+    CachedMember m;
+    m.parent_id = parent_id;
+    m.parent_name = parent_name;
+    m.is_function = is_function;
+    if (!member) return m;
+
+    member->get_symIndexId(&m.id);
+    m.name = safe_symbol_name(member);
+
+    CComPtr<IDiaSymbol> type;
+    if (SUCCEEDED(member->get_type(&type)) && type) {
+        m.type_name = type_name_of(type);
+        if (!is_function) {
+            ULONGLONG len = 0;
+            type->get_length(&len);
+            m.length = len;
+        }
+    }
+
+    DWORD access = 0;
+    member->get_access(&access);
+    m.access = access;
+
+    if (is_function) {
+        // Code size of the member function, when the record carries one.
+        ULONGLONG len = 0;
+        if (SUCCEEDED(member->get_length(&len))) m.length = len;
+
+        BOOL flag = FALSE;
+        if (SUCCEEDED(member->get_virtual(&flag)) && flag) m.is_virtual = true;
+        flag = FALSE;
+        if (SUCCEEDED(member->get_pure(&flag)) && flag) m.is_pure = true;
+        flag = FALSE;
+        if (SUCCEEDED(member->get_isStatic(&flag)) && flag) m.is_static = true;
+    } else {
+        LONG offset = 0;
+        member->get_offset(&offset);
+        m.offset = static_cast<DWORD>(offset);
+
+        DWORD loc_type = 0;
+        member->get_locationType(&loc_type);
+        m.is_static = (loc_type == LocIsStatic);
+
+        // get_virtual is never TRUE on a SymTagData child -- `virtual` is a
+        // property of member FUNCTIONS. Read it anyway so the field stays faithful
+        // to whatever DIA reports rather than being hardcoded.
+        BOOL virt = FALSE;
+        if (SUCCEEDED(member->get_virtual(&virt)) && virt) m.is_virtual = true;
+    }
+
+    return m;
+}
+
 // Human-readable SymTagEnum name for the `symbol_at.kind` column. Covers the tags
 // findSymbolByRVA(SymTagNull) can return; anything else falls back to "other".
+// Lowercase, snake_case -- one vocabulary for every enum-ish text column in the
+// schema (see access_text / location_text). Mixed conventions across columns are
+// a trap: an agent that learns one spelling then guesses wrong on another.
 inline const char* symtag_name(DWORD tag) {
     switch (static_cast<enum SymTagEnum>(tag)) {
-        case SymTagFunction:     return "Function";
-        case SymTagData:         return "Data";
-        case SymTagPublicSymbol: return "PublicSymbol";
-        case SymTagLabel:        return "Label";
-        case SymTagThunk:        return "Thunk";
-        case SymTagBlock:        return "Block";
-        case SymTagUDT:          return "UDT";
-        case SymTagEnum:         return "Enum";
-        case SymTagTypedef:      return "Typedef";
+        case SymTagFunction:     return "function";
+        case SymTagData:         return "data";
+        case SymTagPublicSymbol: return "public_symbol";
+        case SymTagLabel:        return "label";
+        case SymTagThunk:        return "thunk";
+        case SymTagBlock:        return "block";
+        case SymTagUDT:          return "udt";
+        case SymTagEnum:         return "enum";
+        case SymTagTypedef:      return "typedef";
         default:                 return "other";
     }
 }
@@ -256,9 +465,24 @@ inline CachedCompiland extract_compiland(IDiaSymbol* symbol) {
         cc.library_name = lib.str();
     }
 
-    DWORD lang = 0;
-    symbol->get_language(&lang);
-    cc.language = lang;
+    // `language` is a property of the compiland's SymTagCompilandDetails CHILD, not
+    // of the compiland symbol. Asking the compiland directly returns S_FALSE and
+    // leaves the out-param untouched -- which read as language 0 ("C") for every
+    // compiland of even a pure C++ program. Note the S_OK (not SUCCEEDED) test:
+    // S_FALSE passes SUCCEEDED but writes nothing, which is exactly how the old
+    // code silently produced a constant.
+    CComPtr<IDiaEnumSymbols> details;
+    if (SUCCEEDED(symbol->findChildren(SymTagCompilandDetails, nullptr, nsNone, &details)) && details) {
+        CComPtr<IDiaSymbol> detail;
+        ULONG fetched = 0;
+        if (SUCCEEDED(details->Next(1, &detail, &fetched)) && fetched == 1 && detail) {
+            DWORD lang = 0;
+            if (detail->get_language(&lang) == S_OK) {
+                cc.language = lang;
+                cc.has_language = true;
+            }
+        }
+    }
 
     return cc;
 }
@@ -307,6 +531,220 @@ public:
         current_ = extract_symbol(symbol, proj_);
         ++rowid_;
         return true;
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// ============================================================================
+// DIA enum codes -> text
+// ============================================================================
+//
+// These columns used to expose the raw CV_* integer, which forced every consumer
+// to carry a decode table. That is a real source of bugs, not just friction: the
+// documented `CASE language WHEN NULL THEN ...` decode silently never matched,
+// because the simple CASE form compares with `=` and NULL = NULL is never true.
+// Text values are self-describing and directly filterable.
+
+// CV_access_e
+inline std::string access_text(DWORD access) {
+    switch (access) {
+        case CV_private:   return "private";
+        case CV_protected: return "protected";
+        case CV_public:    return "public";
+        default:           return "";
+    }
+}
+
+// LocationType (cvconst.h). Named for what an agent would ask about.
+inline std::string location_text(DWORD loc) {
+    switch (loc) {
+        case LocIsStatic:            return "static";
+        case LocIsTLS:               return "tls";
+        case LocIsRegRel:            return "regrel";
+        case LocIsThisRel:           return "thisrel";
+        case LocIsEnregistered:      return "register";
+        case LocIsBitField:          return "bitfield";
+        case LocIsSlot:              return "slot";
+        case LocIsIlRel:             return "ilrel";
+        case LocInMetaData:          return "metadata";
+        case LocIsConstant:          return "constant";
+        case LocIsNull:              return "";
+        default:                     return "";
+    }
+}
+
+// CV_SourceChksum_t
+inline std::string checksum_text(DWORD kind) {
+    switch (kind) {
+        case CHKSUM_TYPE_NONE:    return "none";
+        case CHKSUM_TYPE_MD5:     return "md5";
+        case CHKSUM_TYPE_SHA1:    return "sha1";
+        case CHKSUM_TYPE_SHA_256: return "sha256";
+        default:                  return "";
+    }
+}
+
+// CV_CFL_LANG. Returns "" for an unrecognized code so the caller can decide
+// between NULL and a passthrough.
+inline std::string language_text(DWORD lang) {
+    switch (lang) {
+        case CV_CFL_C:       return "C";
+        case CV_CFL_CXX:     return "C++";
+        case CV_CFL_FORTRAN: return "Fortran";
+        case CV_CFL_MASM:    return "MASM";
+        case CV_CFL_PASCAL:  return "Pascal";
+        case CV_CFL_BASIC:   return "Basic";
+        case CV_CFL_COBOL:   return "COBOL";
+        case CV_CFL_LINK:    return "LINK";
+        case CV_CFL_CVTRES:  return "CVTRES";
+        case CV_CFL_CVTPGD:  return "CVTPGD";
+        case CV_CFL_CSHARP:  return "C#";
+        case CV_CFL_VB:      return "VB";
+        case CV_CFL_ILASM:   return "ILASM";
+        case CV_CFL_JAVA:    return "Java";
+        case CV_CFL_JSCRIPT: return "JScript";
+        case CV_CFL_MSIL:    return "MSIL";
+        case CV_CFL_HLSL:    return "HLSL";
+        default:             return "";
+    }
+}
+
+// Names DIA emits for types that have no name of their own. These are display
+// PLACEHOLDERS, not identifiers: dozens of unrelated types share one, and they
+// cannot be resolved through DIA's name index at all (a `WHERE name = X` lookup
+// finds nothing while a scan returns every anonymous type). Reporting them as
+// SQL NULL is what makes the two paths agree; grouping by them would also merge
+// types that have nothing to do with each other.
+inline bool is_placeholder_type_name(const std::string& name) {
+    return name.empty() || name == "<unnamed-tag>" || name == "<anonymous-tag>";
+}
+
+// One row per DISTINCT type name, streaming.
+//
+// DIA emits a type record per compiland that defines the type, so a raw
+// enumeration repeats names — on a large PDB, 1.75M records collapse to 1.23M
+// distinct names. That made the naive `SELECT ... FROM udts ORDER BY length DESC
+// LIMIT 10` return a half-duplicate top-N, and it made `WHERE name = X` (which
+// resolves DIA's single canonical record) disagree with a scan.
+//
+// Dedup is STREAMING on purpose: the set only remembers what has already been
+// passed, so a LIMIT stays cheap and never pays for the whole table. Per-name
+// aggregates (how many compilands define a type, the max length across records)
+// deliberately live on the *_records tables instead — computing them here would
+// require draining the entire enumeration before emitting the first row.
+//
+// Anonymous types are never deduplicated: each record is its own type and only
+// shares a placeholder label.
+class DedupedSymbolGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    enum SymTagEnum tag_;
+    SymbolProjection proj_;
+    CComPtr<IDiaEnumSymbols> symbols_;
+    std::unordered_set<std::string> seen_;
+    CachedSymbol current_;
+    int64_t rowid_ = -1;
+    bool started_ = false;
+
+public:
+    DedupedSymbolGenerator(PdbSession& session, enum SymTagEnum tag, SymbolProjection proj = {})
+        : session_(session), tag_(tag), proj_(proj) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            symbols_ = session_.enum_symbols(tag_);
+        }
+        if (!symbols_) return false;
+
+        for (;;) {
+            CComPtr<IDiaSymbol> symbol;
+            ULONG fetched = 0;
+            if (FAILED(symbols_->Next(1, &symbol, &fetched)) || fetched != 1) return false;
+
+            CachedSymbol cs = extract_symbol(symbol, proj_);
+            // Anonymous types pass through un-deduplicated -- each record is its
+            // own type. The column getter renders the placeholder as NULL.
+            if (is_placeholder_type_name(cs.name)) {
+                current_ = std::move(cs);
+                ++rowid_;
+                return true;
+            }
+            if (!seen_.insert(cs.name).second) continue;  // already emitted this type
+            current_ = std::move(cs);
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// Streams symbols that are NOT children of the global scope.
+//
+// DIA nests some symbol kinds under a parent: thunks hang off their compiland and
+// labels off their function. Enumerating them from the global scope -- the way
+// every other symbol table here is enumerated -- silently yields nothing, which is
+// why `thunks` and `labels` used to return 0 rows on every PDB, including ones
+// demonstrably full of both. Walks parents lazily, one child list at a time.
+class NestedSymbolGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    enum SymTagEnum parent_tag_;
+    enum SymTagEnum child_tag_;
+    SymbolProjection proj_;
+
+    CComPtr<IDiaEnumSymbols> parents_;
+    CComPtr<IDiaEnumSymbols> children_;
+    CachedSymbol current_;
+    int64_t rowid_ = -1;
+    bool started_ = false;
+
+    bool advance_parent() {
+        children_.Release();
+        CComPtr<IDiaSymbol> parent;
+        ULONG fetched = 0;
+        while (SUCCEEDED(parents_->Next(1, &parent, &fetched)) && fetched == 1) {
+            if (SUCCEEDED(parent->findChildren(child_tag_, nullptr, nsNone, &children_)) && children_) {
+                return true;
+            }
+            parent.Release();
+        }
+        return false;
+    }
+
+public:
+    NestedSymbolGenerator(PdbSession& session,
+                          enum SymTagEnum parent_tag,
+                          enum SymTagEnum child_tag,
+                          SymbolProjection proj = {})
+        : session_(session), parent_tag_(parent_tag), child_tag_(child_tag), proj_(proj) {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            parents_ = session_.enum_symbols(parent_tag_);
+            if (!parents_) return false;
+            if (!advance_parent()) return false;
+        }
+
+        while (true) {
+            if (!children_) {
+                if (!advance_parent()) return false;
+            }
+
+            CComPtr<IDiaSymbol> child;
+            ULONG fetched = 0;
+            if (FAILED(children_->Next(1, &child, &fetched)) || fetched != 1) {
+                children_.Release();
+                continue;
+            }
+
+            current_ = extract_symbol(child, proj_);
+            ++rowid_;
+            return true;
+        }
     }
 
     const CachedSymbol& current() const override { return current_; }
@@ -574,10 +1012,14 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
+// Walks every UDT and yields one child kind -- SymTagData for `udt_fields`,
+// SymTagFunction for `udt_methods`. Keeping the two as separate tables (rather
+// than one table with a discriminator) is what lets every column mean something
+// on every row: a field always has an offset, a method never does.
 class MemberGenerator : public xsql::Generator<CachedMember> {
     PdbSession& session_;
+    enum SymTagEnum child_tag_;
     CComPtr<IDiaEnumSymbols> udts_;
-    CComPtr<IDiaSymbol> current_udt_;
     DWORD current_udt_id_ = 0;
     std::string current_udt_name_;
     CComPtr<IDiaEnumSymbols> members_;
@@ -587,7 +1029,6 @@ class MemberGenerator : public xsql::Generator<CachedMember> {
     bool started_ = false;
 
     bool advance_udt() {
-        current_udt_.Release();
         current_udt_id_ = 0;
         current_udt_name_.clear();
         members_.Release();
@@ -595,24 +1036,24 @@ class MemberGenerator : public xsql::Generator<CachedMember> {
         CComPtr<IDiaSymbol> udt;
         ULONG fetched = 0;
         while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
-            current_udt_ = udt;
-            current_udt_->get_symIndexId(&current_udt_id_);
-            current_udt_name_ = safe_symbol_name(current_udt_);
-
-            if (SUCCEEDED(current_udt_->findChildren(SymTagData, nullptr, nsNone, &members_)) && members_) {
+            DWORD id = 0;
+            udt->get_symIndexId(&id);
+            std::string name = safe_symbol_name(udt);
+            CComPtr<IDiaEnumSymbols> children;
+            if (SUCCEEDED(udt->findChildren(child_tag_, nullptr, nsNone, &children)) && children) {
+                current_udt_id_ = id;
+                current_udt_name_ = std::move(name);
+                members_ = children;
                 return true;
             }
-
             udt.Release();
-            current_udt_.Release();
-            current_udt_id_ = 0;
-            current_udt_name_.clear();
         }
         return false;
     }
 
 public:
-    explicit MemberGenerator(PdbSession& session) : session_(session) {}
+    MemberGenerator(PdbSession& session, enum SymTagEnum child_tag)
+        : session_(session), child_tag_(child_tag) {}
 
     bool next() override {
         if (!started_) {
@@ -634,37 +1075,8 @@ public:
                 continue;
             }
 
-            current_ = {};
-            current_.parent_id = current_udt_id_;
-            current_.parent_name = current_udt_name_;
-
-            member->get_symIndexId(&current_.id);
-            current_.name = safe_symbol_name(member);
-
-            CComPtr<IDiaSymbol> type;
-            if (SUCCEEDED(member->get_type(&type)) && type) {
-                current_.type_name = safe_symbol_name(type);
-                ULONGLONG len = 0;
-                type->get_length(&len);
-                current_.length = len;
-            }
-
-            LONG offset = 0;
-            member->get_offset(&offset);
-            current_.offset = static_cast<DWORD>(offset);
-
-            DWORD access = 0;
-            member->get_access(&access);
-            current_.access = access;
-
-            DWORD loc_type = 0;
-            member->get_locationType(&loc_type);
-            current_.is_static = (loc_type == LocIsStatic);
-
-            BOOL virt = FALSE;
-            member->get_virtual(&virt);
-            current_.is_virtual = (virt != FALSE);
-
+            current_ = extract_member(member, child_tag_ == SymTagFunction,
+                                      current_udt_id_, current_udt_name_);
             ++rowid_;
             return true;
         }
@@ -877,6 +1289,7 @@ class LocalOrParamGenerator : public xsql::Generator<CachedLocal> {
 
     CachedLocal current_;
     int64_t rowid_ = -1;
+    int64_t next_ordinal_ = 0;
     bool started_ = false;
 
     bool advance_func() {
@@ -884,6 +1297,7 @@ class LocalOrParamGenerator : public xsql::Generator<CachedLocal> {
         current_func_id_ = 0;
         current_func_name_.clear();
         data_syms_.Release();
+        next_ordinal_ = 0;  // ordinal is per-function, not per-scan
 
         CComPtr<IDiaSymbol> func;
         ULONG fetched = 0;
@@ -937,13 +1351,14 @@ public:
             current_ = {};
             current_.func_id = current_func_id_;
             current_.func_name = current_func_name_;
+            current_.ordinal = next_ordinal_++;
 
             data->get_symIndexId(&current_.id);
             current_.name = safe_symbol_name(data);
 
             CComPtr<IDiaSymbol> type;
             if (SUCCEEDED(data->get_type(&type)) && type) {
-                current_.type_name = safe_symbol_name(type);
+                current_.type_name = type_name_of(type);
             }
 
             DWORD loc_type = 0;
@@ -954,7 +1369,14 @@ public:
             DWORD reg = 0;
             data->get_offset(&offset);
             data->get_registerId(&reg);
-            current_.offset_or_register = (loc_type == LocIsRegRel) ? offset : static_cast<int64_t>(reg);
+            if (loc_type == LocIsRegRel || loc_type == LocIsThisRel) {
+                current_.frame_offset = offset;
+                current_.has_frame_offset = true;
+            }
+            if (reg != 0) {
+                current_.register_id = static_cast<int64_t>(reg);
+                current_.has_register = true;
+            }
 
             ++rowid_;
             return true;
@@ -1462,6 +1884,7 @@ public:
 class UdtMembersByIdGenerator : public xsql::Generator<CachedMember> {
     PdbSession& session_;
     DWORD udt_id_ = 0;
+    enum SymTagEnum child_tag_;
     bool started_ = false;
     DWORD parent_id_ = 0;
     std::string parent_name_;
@@ -1470,9 +1893,10 @@ class UdtMembersByIdGenerator : public xsql::Generator<CachedMember> {
     int64_t rowid_ = -1;
 
 public:
-    UdtMembersByIdGenerator(PdbSession& session, DWORD udt_id)
+    UdtMembersByIdGenerator(PdbSession& session, DWORD udt_id, enum SymTagEnum child_tag)
         : session_(session)
         , udt_id_(udt_id)
+        , child_tag_(child_tag)
     {}
 
     bool next() override {
@@ -1491,47 +1915,20 @@ public:
 
             parent_id_ = udt_id_;
             parent_name_ = safe_symbol_name(udt);
-            if (FAILED(udt->findChildren(SymTagData, nullptr, nsNone, &members_)) || !members_) return false;
+            if (FAILED(udt->findChildren(child_tag_, nullptr, nsNone, &members_))) {
+                members_.Release();
+            }
         }
+
+        if (!members_) return false;
 
         while (true) {
             CComPtr<IDiaSymbol> member;
             ULONG fetched = 0;
-            if (FAILED(members_->Next(1, &member, &fetched)) || fetched != 1) {
-                return false;
-            }
+            if (FAILED(members_->Next(1, &member, &fetched)) || fetched != 1) return false;
 
-            current_ = {};
-            current_.parent_id = parent_id_;
-            current_.parent_name = parent_name_;
-
-            member->get_symIndexId(&current_.id);
-            current_.name = safe_symbol_name(member);
-
-            CComPtr<IDiaSymbol> type;
-            if (SUCCEEDED(member->get_type(&type)) && type) {
-                current_.type_name = safe_symbol_name(type);
-                ULONGLONG len = 0;
-                type->get_length(&len);
-                current_.length = len;
-            }
-
-            LONG offset = 0;
-            member->get_offset(&offset);
-            current_.offset = static_cast<DWORD>(offset);
-
-            DWORD access = 0;
-            member->get_access(&access);
-            current_.access = access;
-
-            DWORD loc_type = 0;
-            member->get_locationType(&loc_type);
-            current_.is_static = (loc_type == LocIsStatic);
-
-            BOOL virt = FALSE;
-            member->get_virtual(&virt);
-            current_.is_virtual = (virt != FALSE);
-
+            current_ = extract_member(member, child_tag_ == SymTagFunction,
+                                      parent_id_, parent_name_);
             ++rowid_;
             return true;
         }
@@ -1545,8 +1942,8 @@ class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
     PdbSession& session_;
     std::string udt_name_;
 
+    enum SymTagEnum child_tag_;
     CComPtr<IDiaEnumSymbols> udts_;
-    CComPtr<IDiaSymbol> current_udt_;
     DWORD parent_id_ = 0;
     std::string parent_name_;
     CComPtr<IDiaEnumSymbols> members_;
@@ -1556,7 +1953,6 @@ class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
     bool started_ = false;
 
     bool advance_udt() {
-        current_udt_.Release();
         parent_id_ = 0;
         parent_name_.clear();
         members_.Release();
@@ -1564,24 +1960,26 @@ class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
         CComPtr<IDiaSymbol> udt;
         ULONG fetched = 0;
         while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
-            current_udt_ = udt;
-            current_udt_->get_symIndexId(&parent_id_);
-            parent_name_ = safe_symbol_name(current_udt_);
-            if (SUCCEEDED(current_udt_->findChildren(SymTagData, nullptr, nsNone, &members_)) && members_) {
+            DWORD id = 0;
+            udt->get_symIndexId(&id);
+            std::string name = safe_symbol_name(udt);
+            CComPtr<IDiaEnumSymbols> children;
+            if (SUCCEEDED(udt->findChildren(child_tag_, nullptr, nsNone, &children)) && children) {
+                parent_id_ = id;
+                parent_name_ = std::move(name);
+                members_ = children;
                 return true;
             }
             udt.Release();
-            current_udt_.Release();
-            parent_id_ = 0;
-            parent_name_.clear();
         }
         return false;
     }
 
 public:
-    UdtMembersByNameGenerator(PdbSession& session, std::string udt_name)
+    UdtMembersByNameGenerator(PdbSession& session, std::string udt_name, enum SymTagEnum child_tag)
         : session_(session)
         , udt_name_(std::move(udt_name))
+        , child_tag_(child_tag)
     {}
 
     bool next() override {
@@ -1604,37 +2002,8 @@ public:
                 continue;
             }
 
-            current_ = {};
-            current_.parent_id = parent_id_;
-            current_.parent_name = parent_name_;
-
-            member->get_symIndexId(&current_.id);
-            current_.name = safe_symbol_name(member);
-
-            CComPtr<IDiaSymbol> type;
-            if (SUCCEEDED(member->get_type(&type)) && type) {
-                current_.type_name = safe_symbol_name(type);
-                ULONGLONG len = 0;
-                type->get_length(&len);
-                current_.length = len;
-            }
-
-            LONG offset = 0;
-            member->get_offset(&offset);
-            current_.offset = static_cast<DWORD>(offset);
-
-            DWORD access = 0;
-            member->get_access(&access);
-            current_.access = access;
-
-            DWORD loc_type = 0;
-            member->get_locationType(&loc_type);
-            current_.is_static = (loc_type == LocIsStatic);
-
-            BOOL virt = FALSE;
-            member->get_virtual(&virt);
-            current_.is_virtual = (virt != FALSE);
-
+            current_ = extract_member(member, child_tag_ == SymTagFunction,
+                                      parent_id_, parent_name_);
             ++rowid_;
             return true;
         }
@@ -1823,6 +2192,117 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
+// Fill a base_classes row from one SymTagBaseClass child of `derived`.
+inline CachedBaseClass extract_base_class(IDiaSymbol* base,
+                                          DWORD derived_id,
+                                          const std::string& derived_name) {
+    CachedBaseClass bc;
+    bc.derived_id = derived_id;
+    bc.derived_name = derived_name;
+    if (!base) return bc;
+
+    CComPtr<IDiaSymbol> base_type;
+    if (SUCCEEDED(base->get_type(&base_type)) && base_type) {
+        base_type->get_symIndexId(&bc.base_id);
+        bc.base_name = safe_symbol_name(base_type);
+    }
+
+    LONG offset = 0;
+    base->get_offset(&offset);
+    bc.offset = static_cast<DWORD>(offset);
+
+    BOOL virt = FALSE;
+    base->get_virtualBaseClass(&virt);
+    bc.is_virtual = (virt != FALSE);
+
+    DWORD access = 0;
+    base->get_access(&access);
+    bc.access = access;
+    return bc;
+}
+
+// `WHERE derived_name = X` -- resolve the UDT(s) by name, then read their
+// SymTagBaseClass children.
+//
+// This is the child -> parent direction, the only one DIA indexes: a derived class
+// records its bases, and nothing records a base's subclasses. So an UPWARD walk
+// (a class to its ancestors) is index-backed here, while the downward walk
+// (`WHERE base_name = X` -> all subclasses) still costs a full scan per step.
+// Name lookup can match several UDT records because DIA emits one per defining
+// compiland, so every match is walked.
+class BaseClassesByDerivedNameGenerator : public xsql::Generator<CachedBaseClass> {
+    PdbSession& session_;
+    std::string derived_name_;
+
+    CComPtr<IDiaEnumSymbols> udts_;
+    CComPtr<IDiaSymbol> current_udt_;
+    DWORD derived_id_ = 0;
+    std::string resolved_name_;
+    CComPtr<IDiaEnumSymbols> bases_;
+
+    CachedBaseClass current_;
+    int64_t rowid_ = -1;
+    bool started_ = false;
+
+    bool advance_udt() {
+        current_udt_.Release();
+        derived_id_ = 0;
+        resolved_name_.clear();
+        bases_.Release();
+
+        CComPtr<IDiaSymbol> udt;
+        ULONG fetched = 0;
+        while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            current_udt_ = udt;
+            current_udt_->get_symIndexId(&derived_id_);
+            resolved_name_ = safe_symbol_name(current_udt_);
+            if (SUCCEEDED(current_udt_->findChildren(SymTagBaseClass, nullptr, nsNone, &bases_)) && bases_) {
+                return true;
+            }
+            udt.Release();
+            current_udt_.Release();
+            derived_id_ = 0;
+            resolved_name_.clear();
+        }
+        return false;
+    }
+
+public:
+    BaseClassesByDerivedNameGenerator(PdbSession& session, std::string derived_name)
+        : session_(session)
+        , derived_name_(std::move(derived_name))
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            udts_ = session_.find_symbols(derived_name_, SymTagUDT);
+            if (!udts_) return false;
+            if (!advance_udt()) return false;
+        }
+
+        while (true) {
+            if (!bases_) {
+                if (!advance_udt()) return false;
+            }
+
+            CComPtr<IDiaSymbol> base;
+            ULONG fetched = 0;
+            if (FAILED(bases_->Next(1, &base, &fetched)) || fetched != 1) {
+                bases_.Release();
+                continue;
+            }
+
+            current_ = extract_base_class(base, derived_id_, resolved_name_);
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedBaseClass& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
 class BaseClassesByDerivedIdGenerator : public xsql::Generator<CachedBaseClass> {
     PdbSession& session_;
     DWORD derived_id_ = 0;
@@ -1863,28 +2343,7 @@ public:
                 return false;
             }
 
-            current_ = {};
-            current_.derived_id = derived_id_;
-            current_.derived_name = derived_name_;
-
-            CComPtr<IDiaSymbol> base_type;
-            if (SUCCEEDED(base->get_type(&base_type)) && base_type) {
-                base_type->get_symIndexId(&current_.base_id);
-                current_.base_name = safe_symbol_name(base_type);
-            }
-
-            LONG offset = 0;
-            base->get_offset(&offset);
-            current_.offset = static_cast<DWORD>(offset);
-
-            BOOL virt = FALSE;
-            base->get_virtualBaseClass(&virt);
-            current_.is_virtual = (virt != FALSE);
-
-            DWORD access = 0;
-            base->get_access(&access);
-            current_.access = access;
-
+            current_ = extract_base_class(base, derived_id_, derived_name_);
             ++rowid_;
             return true;
         }
@@ -1903,6 +2362,7 @@ class LocalOrParamByFuncIdGenerator : public xsql::Generator<CachedLocal> {
     CComPtr<IDiaEnumSymbols> data_syms_;
     CachedLocal current_;
     int64_t rowid_ = -1;
+    int64_t next_ordinal_ = 0;
 
 public:
     LocalOrParamByFuncIdGenerator(PdbSession& session, DWORD func_id, DWORD want_kind)
@@ -1946,12 +2406,13 @@ public:
             current_ = {};
             current_.func_id = func_id_;
             current_.func_name = func_name_;
+            current_.ordinal = next_ordinal_++;
             data->get_symIndexId(&current_.id);
             current_.name = safe_symbol_name(data);
 
             CComPtr<IDiaSymbol> type;
             if (SUCCEEDED(data->get_type(&type)) && type) {
-                current_.type_name = safe_symbol_name(type);
+                current_.type_name = type_name_of(type);
             }
 
             DWORD loc_type = 0;
@@ -1962,7 +2423,14 @@ public:
             DWORD reg = 0;
             data->get_offset(&offset);
             data->get_registerId(&reg);
-            current_.offset_or_register = (loc_type == LocIsRegRel) ? offset : static_cast<int64_t>(reg);
+            if (loc_type == LocIsRegRel || loc_type == LocIsThisRel) {
+                current_.frame_offset = offset;
+                current_.has_frame_offset = true;
+            }
+            if (reg != 0) {
+                current_.register_id = static_cast<int64_t>(reg);
+                current_.has_register = true;
+            }
 
             ++rowid_;
             return true;
@@ -2136,25 +2604,62 @@ inline GeneratorTableDef<CachedSymbol> define_data_table(PdbSession& session) {
 }
 
 // UDT (structs/classes) table
+// A type name is NULL for anonymous types (see is_placeholder_type_name). This
+// lives on the COLUMN, not the generator, so the deduplicated table and its
+// *_records twin cannot disagree about what an anonymous type is called.
+inline std::optional<std::string> type_name_or_null(const CachedSymbol& r) {
+    if (is_placeholder_type_name(r.name)) return std::nullopt;
+    return r.name;
+}
+
+// One row per distinct type. NO .row_count() shortcut: DIA's get_Count(SymTagUDT)
+// is *slower* than enumerating on a large PDB -- measured on a 3.14 GB PDB, the
+// shortcut blew past the 60 s default timeout and errored, while a full walk plus
+// dedup returned 1,229,669 rows in 59 s. It also could not answer the deduped
+// count anyway.
 inline GeneratorTableDef<CachedSymbol> define_udts_table(PdbSession& session) {
     return generator_table<CachedSymbol>("udts")
         .estimate_rows([]() { return kSymbolRowEstimate; })
-        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagUDT)); })
-        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagUDT, symbol_projection_from(col_used, -1)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<DedupedSymbolGenerator>(session, SymTagUDT, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
-        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column("name", xsql::ColumnType::Text,
+                xsql::detail::row_getter_nullable_text<CachedSymbol>(type_name_or_null))
         .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
         .build();
 }
 
-// Enums table
+// The raw per-compiland type records behind `udts`. Use this for "how many
+// translation units define this type" and other per-record questions.
+inline GeneratorTableDef<CachedSymbol> define_udt_records_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("udt_records")
+        .estimate_rows([]() { return kSymbolRowEstimate; })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagUDT, symbol_projection_from(col_used, -1)); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column("name", xsql::ColumnType::Text,
+                xsql::detail::row_getter_nullable_text<CachedSymbol>(type_name_or_null))
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
+        .build();
+}
+
+// Enums table -- same dedup model as udts.
 inline GeneratorTableDef<CachedSymbol> define_enums_table(PdbSession& session) {
     return generator_table<CachedSymbol>("enums")
         .estimate_rows([]() { return kSymbolRowEstimate; })
-        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagEnum)); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<DedupedSymbolGenerator>(session, SymTagEnum, symbol_projection_from(col_used, -1)); })
+        .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
+        .column("name", xsql::ColumnType::Text,
+                xsql::detail::row_getter_nullable_text<CachedSymbol>(type_name_or_null))
+        .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
+        .build();
+}
+
+inline GeneratorTableDef<CachedSymbol> define_enum_records_table(PdbSession& session) {
+    return generator_table<CachedSymbol>("enum_records")
+        .estimate_rows([]() { return kSymbolRowEstimate; })
         .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagEnum, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
-        .column_text("name", [](const CachedSymbol& r) { return r.name; })
+        .column("name", xsql::ColumnType::Text,
+                xsql::detail::row_getter_nullable_text<CachedSymbol>(type_name_or_null))
         .column_int64("length", [](const CachedSymbol& r) { return static_cast<int64_t>(r.length); })
         .build();
 }
@@ -2180,7 +2685,20 @@ inline GeneratorTableDef<CachedCompiland> define_compilands_table(PdbSession& se
         .column_int64("id", [](const CachedCompiland& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedCompiland& r) { return r.name; })
         .column_text("library", [](const CachedCompiland& r) { return r.library_name; })
-        .column_int("language", [](const CachedCompiland& r) { return static_cast<int>(r.language); })
+        // NULL rather than a misleading 0 when the compiland reports no language at
+        // all (~10% of compilands on a real shipping PDB have no CompilandDetails
+        // child). 0 is a valid CV_CFL_LANG value meaning C, so it cannot double as
+        // "unknown".
+        // TEXT, and NULL when the compiland records no language at all (~10% of
+        // compilands on a real shipping PDB). An unrecognized code passes through
+        // as its number so nothing is silently lost.
+        .column("language", xsql::ColumnType::Text,
+                xsql::detail::row_getter_nullable_text<CachedCompiland>(
+                    [](const CachedCompiland& r) -> std::optional<std::string> {
+                        if (!r.has_language) return std::nullopt;
+                        const std::string t = language_text(r.language);
+                        return t.empty() ? std::to_string(r.language) : t;
+                    }))
         .build();
 }
 
@@ -2191,7 +2709,7 @@ inline GeneratorTableDef<CachedSourceFile> define_source_files_table(PdbSession&
         .generator([&session]() { return std::make_unique<SourceFileGenerator>(session); })
         .column_int64("id", [](const CachedSourceFile& r) { return static_cast<int64_t>(r.id); })
         .column_text("filename", [](const CachedSourceFile& r) { return r.filename; })
-        .column_int("checksum_type", [](const CachedSourceFile& r) { return static_cast<int>(r.checksum_type); })
+        .column_text("checksum_type", [](const CachedSourceFile& r) { return checksum_text(r.checksum_type); })
         .build();
 }
 
@@ -2232,11 +2750,13 @@ inline GeneratorTableDef<CachedSection> define_sections_table(PdbSession& sessio
 }
 
 // Thunks table
+// Thunks are compiland children, so both the scan and the count must walk
+// compilands. No .row_count() override: count_symbols() asks the global scope,
+// which reports 0 and would contradict the scan.
 inline GeneratorTableDef<CachedSymbol> define_thunks_table(PdbSession& session) {
     return generator_table<CachedSymbol>("thunks")
-        .estimate_rows([]() { return kSymbolRowEstimate; })
-        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagThunk)); })
-        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagThunk, symbol_projection_from(col_used, -1)); })
+        .estimate_rows([]() { return static_cast<size_t>(10000); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<NestedSymbolGenerator>(session, SymTagCompiland, SymTagThunk, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
@@ -2245,12 +2765,11 @@ inline GeneratorTableDef<CachedSymbol> define_thunks_table(PdbSession& session) 
         .build();
 }
 
-// Labels table
+// Labels are function children -- same reasoning as thunks above.
 inline GeneratorTableDef<CachedSymbol> define_labels_table(PdbSession& session) {
     return generator_table<CachedSymbol>("labels")
-        .estimate_rows([]() { return kSymbolRowEstimate; })
-        .row_count([&session]() { return to_size_t_clamped(session.count_symbols(SymTagLabel)); })
-        .projection_generator([&session](uint64_t col_used) { return std::make_unique<SymbolGenerator>(session, SymTagLabel, symbol_projection_from(col_used, -1)); })
+        .estimate_rows([]() { return static_cast<size_t>(10000); })
+        .projection_generator([&session](uint64_t col_used) { return std::make_unique<NestedSymbolGenerator>(session, SymTagFunction, SymTagLabel, symbol_projection_from(col_used, -1)); })
         .column_int64("id", [](const CachedSymbol& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedSymbol& r) { return r.name; })
         .column_int64("rva", [](const CachedSymbol& r) { return static_cast<int64_t>(r.rva); })
@@ -2259,11 +2778,15 @@ inline GeneratorTableDef<CachedSymbol> define_labels_table(PdbSession& session) 
         .build();
 }
 
-// UDT members table
-inline GeneratorTableDef<CachedMember> define_udt_members_table(PdbSession& session) {
-    return generator_table<CachedMember>("udt_members")
+// Data members of structs/classes/unions.
+//
+// Fields and methods are separate tables rather than one table with a `kind`
+// discriminator, so every column is meaningful on every row: a field always has
+// an offset; a method never does, and only a method can be virtual or pure.
+inline GeneratorTableDef<CachedMember> define_udt_fields_table(PdbSession& session) {
+    return generator_table<CachedMember>("udt_fields")
         .estimate_rows([]() { return static_cast<size_t>(100000); })
-        .generator([&session]() { return std::make_unique<MemberGenerator>(session); })
+        .generator([&session]() { return std::make_unique<MemberGenerator>(session, SymTagData); })
         .column_int64("udt_id", [](const CachedMember& r) { return static_cast<int64_t>(r.parent_id); })
         .column_text("udt_name", [](const CachedMember& r) { return r.parent_name; })
         .column_int64("id", [](const CachedMember& r) { return static_cast<int64_t>(r.id); })
@@ -2271,9 +2794,26 @@ inline GeneratorTableDef<CachedMember> define_udt_members_table(PdbSession& sess
         .column_text("type", [](const CachedMember& r) { return r.type_name; })
         .column_int("offset", [](const CachedMember& r) { return static_cast<int>(r.offset); })
         .column_int64("length", [](const CachedMember& r) { return static_cast<int64_t>(r.length); })
-        .column_int("access", [](const CachedMember& r) { return static_cast<int>(r.access); })
+        .column_text("access", [](const CachedMember& r) { return access_text(r.access); })
+        .column_int("is_static", [](const CachedMember& r) { return r.is_static ? 1 : 0; })
+        .build();
+}
+
+// Member functions of structs/classes/unions. `type` is the rendered signature.
+inline GeneratorTableDef<CachedMember> define_udt_methods_table(PdbSession& session) {
+    return generator_table<CachedMember>("udt_methods")
+        .estimate_rows([]() { return static_cast<size_t>(100000); })
+        .generator([&session]() { return std::make_unique<MemberGenerator>(session, SymTagFunction); })
+        .column_int64("udt_id", [](const CachedMember& r) { return static_cast<int64_t>(r.parent_id); })
+        .column_text("udt_name", [](const CachedMember& r) { return r.parent_name; })
+        .column_int64("id", [](const CachedMember& r) { return static_cast<int64_t>(r.id); })
+        .column_text("name", [](const CachedMember& r) { return r.name; })
+        .column_text("type", [](const CachedMember& r) { return r.type_name; })
+        .column_int64("length", [](const CachedMember& r) { return static_cast<int64_t>(r.length); })
+        .column_text("access", [](const CachedMember& r) { return access_text(r.access); })
         .column_int("is_static", [](const CachedMember& r) { return r.is_static ? 1 : 0; })
         .column_int("is_virtual", [](const CachedMember& r) { return r.is_virtual ? 1 : 0; })
+        .column_int("is_pure", [](const CachedMember& r) { return r.is_pure ? 1 : 0; })
         .build();
 }
 
@@ -2301,7 +2841,7 @@ inline GeneratorTableDef<CachedBaseClass> define_base_classes_table(PdbSession& 
         .column_text("base_name", [](const CachedBaseClass& r) { return r.base_name; })
         .column_int("offset", [](const CachedBaseClass& r) { return static_cast<int>(r.offset); })
         .column_int("is_virtual", [](const CachedBaseClass& r) { return r.is_virtual ? 1 : 0; })
-        .column_int("access", [](const CachedBaseClass& r) { return static_cast<int>(r.access); })
+        .column_text("access", [](const CachedBaseClass& r) { return access_text(r.access); })
         .build();
 }
 
@@ -2315,8 +2855,19 @@ inline GeneratorTableDef<CachedLocal> define_locals_table(PdbSession& session) {
         .column_int64("id", [](const CachedLocal& r) { return static_cast<int64_t>(r.id); })
         .column_text("name", [](const CachedLocal& r) { return r.name; })
         .column_text("type", [](const CachedLocal& r) { return r.type_name; })
-        .column_int("location_type", [](const CachedLocal& r) { return static_cast<int>(r.location_type); })
-        .column_int64("offset_or_register", [](const CachedLocal& r) { return r.offset_or_register; })
+        .column_text("location", [](const CachedLocal& r) { return location_text(r.location_type); })
+        .column("frame_offset", xsql::ColumnType::Integer,
+                xsql::detail::row_getter_nullable_int<CachedLocal>(
+                    [](const CachedLocal& r) -> std::optional<int> {
+                        if (!r.has_frame_offset) return std::nullopt;
+                        return static_cast<int>(r.frame_offset);
+                    }))
+        .column("register", xsql::ColumnType::Integer,
+                xsql::detail::row_getter_nullable_int<CachedLocal>(
+                    [](const CachedLocal& r) -> std::optional<int> {
+                        if (!r.has_register) return std::nullopt;
+                        return static_cast<int>(r.register_id);
+                    }))
         .build();
 }
 
@@ -2328,10 +2879,26 @@ inline GeneratorTableDef<CachedLocal> define_parameters_table(PdbSession& sessio
         .column_int64("func_id", [](const CachedLocal& r) { return static_cast<int64_t>(r.func_id); })
         .column_text("func_name", [](const CachedLocal& r) { return r.func_name; })
         .column_int64("id", [](const CachedLocal& r) { return static_cast<int64_t>(r.id); })
+        // 0-based position in the signature. Without this, parameter order was
+        // only recoverable by relying on generator emission order, which SQL does
+        // not guarantee -- so ORDER BY ordinal is the only correct way to
+        // reconstruct a call signature.
+        .column_int64("ordinal", [](const CachedLocal& r) { return r.ordinal; })
         .column_text("name", [](const CachedLocal& r) { return r.name; })
         .column_text("type", [](const CachedLocal& r) { return r.type_name; })
-        .column_int("location_type", [](const CachedLocal& r) { return static_cast<int>(r.location_type); })
-        .column_int64("offset_or_register", [](const CachedLocal& r) { return r.offset_or_register; })
+        .column_text("location", [](const CachedLocal& r) { return location_text(r.location_type); })
+        .column("frame_offset", xsql::ColumnType::Integer,
+                xsql::detail::row_getter_nullable_int<CachedLocal>(
+                    [](const CachedLocal& r) -> std::optional<int> {
+                        if (!r.has_frame_offset) return std::nullopt;
+                        return static_cast<int>(r.frame_offset);
+                    }))
+        .column("register", xsql::ColumnType::Integer,
+                xsql::detail::row_getter_nullable_int<CachedLocal>(
+                    [](const CachedLocal& r) -> std::optional<int> {
+                        if (!r.has_register) return std::nullopt;
+                        return static_cast<int>(r.register_id);
+                    }))
         .build();
 }
 
@@ -2346,7 +2913,9 @@ class TableRegistry {
     GeneratorTableDef<CachedSymbol> publics_;
     GeneratorTableDef<CachedSymbol> data_;
     GeneratorTableDef<CachedSymbol> udts_;
+    GeneratorTableDef<CachedSymbol> udt_records_;
     GeneratorTableDef<CachedSymbol> enums_;
+    GeneratorTableDef<CachedSymbol> enum_records_;
     GeneratorTableDef<CachedSymbol> typedefs_;
     GeneratorTableDef<CachedSymbol> thunks_;
     GeneratorTableDef<CachedSymbol> labels_;
@@ -2358,7 +2927,8 @@ class TableRegistry {
 
     GeneratorTableDef<CachedSection> sections_;
 
-    GeneratorTableDef<CachedMember> udt_members_;
+    GeneratorTableDef<CachedMember> udt_fields_;
+    GeneratorTableDef<CachedMember> udt_methods_;
     GeneratorTableDef<CachedEnumValue> enum_values_;
     GeneratorTableDef<CachedBaseClass> base_classes_;
 
@@ -2383,7 +2953,9 @@ public:
         , publics_(define_publics_table(session_))
         , data_(define_data_table(session_))
         , udts_(define_udts_table(session_))
+        , udt_records_(define_udt_records_table(session_))
         , enums_(define_enums_table(session_))
+        , enum_records_(define_enum_records_table(session_))
         , typedefs_(define_typedefs_table(session_))
         , thunks_(define_thunks_table(session_))
         , labels_(define_labels_table(session_))
@@ -2392,7 +2964,8 @@ public:
         , source_files_(define_source_files_table(session_))
         , line_numbers_(define_line_numbers_table(session_))
         , sections_(define_sections_table(session_))
-        , udt_members_(define_udt_members_table(session_))
+        , udt_fields_(define_udt_fields_table(session_))
+        , udt_methods_(define_udt_methods_table(session_))
         , enum_values_(define_enum_values_table(session_))
         , base_classes_(define_base_classes_table(session_))
         , locals_(define_locals_table(session_))
@@ -2501,6 +3074,22 @@ public:
                            },
                            5.0, 10.0);
 
+        // symbolById is scope-independent, so this is valid for globally-scoped and
+        // nested symbol kinds alike.
+        auto add_id_filter_only = [this](GeneratorTableDef<CachedSymbol>& def, enum SymTagEnum tag) {
+            auto* def_ptr = &def;
+            add_filter_eq(def, "id",
+                          [def_ptr, this, tag](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                              if (id <= 0 || id > 0xFFFFFFFFLL) {
+                                  return std::make_unique<GeneratorRowIterator<CachedSymbol>>(def_ptr, nullptr);
+                              }
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                  def_ptr,
+                                  std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), tag));
+                          },
+                          1.0, 1.0);
+        };
+
         auto add_name_and_id_filters = [this](GeneratorTableDef<CachedSymbol>& def, enum SymTagEnum tag) {
             auto* def_ptr = &def;
             add_filter_eq(def, "id",
@@ -2522,11 +3111,24 @@ public:
                                5.0, 10.0);
         };
 
+        // `udts`/`enums` are deduplicated, and DIA's name index resolves the one
+        // canonical record -- which is exactly the deduplicated answer, so the
+        // pushdown and a scan agree. The *_records tables keep the id filter only:
+        // a name lookup there would return the single canonical record while a
+        // scan returns every per-compiland record, i.e. a pushdown contradicting
+        // its own table.
         add_name_and_id_filters(udts_, SymTagUDT);
         add_name_and_id_filters(enums_, SymTagEnum);
+        add_id_filter_only(udt_records_, SymTagUDT);
+        add_id_filter_only(enum_records_, SymTagEnum);
         add_name_and_id_filters(typedefs_, SymTagTypedef);
-        add_name_and_id_filters(thunks_, SymTagThunk);
-        add_name_and_id_filters(labels_, SymTagLabel);
+        // Thunks/labels get the id filter only. The by-name generator resolves
+        // through the GLOBAL scope, which holds neither kind (they are compiland
+        // and function children), so a name filter would return 0 rows while a
+        // plain scan returns the symbol -- a pushdown that contradicts the table.
+        // symbolById is scope-independent, so the id filter stays valid.
+        add_id_filter_only(thunks_, SymTagThunk);
+        add_id_filter_only(labels_, SymTagLabel);
 
         auto* compilands_def = &compilands_;
         add_filter_eq(compilands_, "id",
@@ -2559,24 +3161,33 @@ public:
                       },
                       1.0, 1.0);
 
-        auto* udt_members_def = &udt_members_;
-        add_filter_eq(udt_members_, "udt_id",
-                      [udt_members_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
-                          if (id <= 0 || id > 0xFFFFFFFFLL) {
-                              return std::make_unique<GeneratorRowIterator<CachedMember>>(udt_members_def, nullptr);
-                          }
-                          return std::make_unique<GeneratorRowIterator<CachedMember>>(
-                              udt_members_def,
-                              std::make_unique<UdtMembersByIdGenerator>(session_, static_cast<DWORD>(id)));
-                      },
-                      10.0, 100.0);
-        add_filter_eq_text(udt_members_, "udt_name",
-                           [udt_members_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
-                               return std::make_unique<GeneratorRowIterator<CachedMember>>(
-                                   udt_members_def,
-                                   std::make_unique<UdtMembersByNameGenerator>(session_, name ? name : ""));
-                           },
-                           10.0, 100.0);
+        // udt_fields / udt_methods share the scoping filters; only the child tag
+        // they enumerate differs.
+        auto add_member_filters = [this](GeneratorTableDef<CachedMember>& def,
+                                         enum SymTagEnum child_tag) {
+            auto* def_ptr = &def;
+            add_filter_eq(def, "udt_id",
+                          [def_ptr, this, child_tag](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                              if (id <= 0 || id > 0xFFFFFFFFLL) {
+                                  return std::make_unique<GeneratorRowIterator<CachedMember>>(def_ptr, nullptr);
+                              }
+                              return std::make_unique<GeneratorRowIterator<CachedMember>>(
+                                  def_ptr,
+                                  std::make_unique<UdtMembersByIdGenerator>(
+                                      session_, static_cast<DWORD>(id), child_tag));
+                          },
+                          10.0, 100.0);
+            add_filter_eq_text(def, "udt_name",
+                               [def_ptr, this, child_tag](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                                   return std::make_unique<GeneratorRowIterator<CachedMember>>(
+                                       def_ptr,
+                                       std::make_unique<UdtMembersByNameGenerator>(
+                                           session_, name ? name : "", child_tag));
+                               },
+                               10.0, 100.0);
+        };
+        add_member_filters(udt_fields_, SymTagData);
+        add_member_filters(udt_methods_, SymTagFunction);
 
         auto* enum_values_def = &enum_values_;
         add_filter_eq(enum_values_, "enum_id",
@@ -2597,6 +3208,12 @@ public:
                            },
                            10.0, 100.0);
 
+        // base_classes pushdown covers the CHILD -> PARENT direction only, because
+        // that is the only direction DIA indexes: findChildren(SymTagBaseClass)
+        // answers "what does this class derive from", and there is no reverse
+        // lookup for "what derives from this class". So `derived_id` and
+        // `derived_name` are index-backed while `base_name`/`base_id` still scan --
+        // seed a hierarchy walk from the derived side and traverse upward.
         auto* base_classes_def = &base_classes_;
         add_filter_eq(base_classes_, "derived_id",
                       [base_classes_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
@@ -2608,6 +3225,13 @@ public:
                               std::make_unique<BaseClassesByDerivedIdGenerator>(session_, static_cast<DWORD>(id)));
                       },
                       10.0, 100.0);
+        add_filter_eq_text(base_classes_, "derived_name",
+                           [base_classes_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedBaseClass>>(
+                                   base_classes_def,
+                                   std::make_unique<BaseClassesByDerivedNameGenerator>(session_, name ? name : ""));
+                           },
+                           10.0, 100.0);
 
         auto* locals_def = &locals_;
         add_filter_eq(locals_, "func_id",
@@ -2651,7 +3275,9 @@ public:
         register_one(db, publics_);
         register_one(db, data_);
         register_one(db, udts_);
+        register_one(db, udt_records_);
         register_one(db, enums_);
+        register_one(db, enum_records_);
         register_one(db, typedefs_);
         register_one(db, thunks_);
         register_one(db, labels_);
@@ -2663,7 +3289,8 @@ public:
 
         register_one(db, sections_);
 
-        register_one(db, udt_members_);
+        register_one(db, udt_fields_);
+        register_one(db, udt_methods_);
         register_one(db, enum_values_);
         register_one(db, base_classes_);
 

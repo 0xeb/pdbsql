@@ -39,14 +39,16 @@ Functions are code symbols with:
 **UDTs** are structs, classes, and unions:
 - `name` - Type name
 - `size` - Size in bytes
-- Members accessible via `udt_members` table
-- Base classes via `base_classes` table
+- Data members via `udt_fields`; member functions via `udt_methods`
+- Base classes via `base_classes` (walk hierarchies **upward** — see that table)
+- `udts` / `enums` are **deduplicated**: one row per distinct type. The raw
+  per-compiland records live in `udt_records` / `enum_records`
 
 ### Compilands
 **Compilands** represent object files (`.obj`) that were linked:
 - `name` - Object file name
 - `library` - Static library if applicable
-- `language` - Source language (C, C++, etc.)
+- `language` - Source language code (NULL when the compiland records none)
 
 ### Source Files and Line Numbers
 PDB files map source code to addresses:
@@ -150,13 +152,33 @@ User-defined types (structs, classes, unions).
 | `name` | TEXT | Type name |
 | `length` | INT | Size in bytes |
 
+> **`udts` gives you one row per distinct type.** DIA emits a type record per
+> *compiland that defines the type*, so the underlying debug info repeats names
+> heavily (1.75M records collapse to ~1.23M distinct names on a large PDB).
+> `udts` deduplicates; **`udt_records`** exposes the raw per-compiland rows for
+> the rare questions that need them.
+>
+> **`name` is NULL for anonymous types.** DIA labels them `<unnamed-tag>` /
+> `<anonymous-tag>`, but those are display placeholders, not names: many unrelated
+> types share one and they cannot be looked up by name. They are reported as NULL
+> and are never merged with each other. Match them with `IS NULL`, never `= '...'`.
+
 ```sql
--- Largest structures
-SELECT name, length FROM udts ORDER BY length DESC LIMIT 10;
+-- Largest structures -- no duplicates
+SELECT name, length FROM udts WHERE name IS NOT NULL ORDER BY length DESC LIMIT 10;
+
+-- Which types are compiled into the most translation units? (header bloat)
+SELECT name, COUNT(*) AS tus FROM udt_records
+WHERE name IS NOT NULL GROUP BY name ORDER BY tus DESC LIMIT 10;
 
 -- Find types by name pattern
 SELECT * FROM udts WHERE name LIKE '%Config%';
 ```
+
+> ⚠️ `SELECT COUNT(*) FROM udts` walks every type record and can exceed the default
+> 60 s timeout on a multi-GB PDB. A `LIMIT` stays cheap (deduplication streams), so
+> prefer bounded queries; raise `query_timeout_ms` deliberately if you truly need a
+> whole-table count.
 
 #### enums
 Enumeration types.
@@ -203,10 +225,16 @@ Code labels (not functions).
 | `section` | INT | PE section number |
 | `offset` | INT | Section offset |
 
+> **Both are nested tables.** Thunks live under their compiland and labels under
+> their function, so a scan of either walks parents rather than the global symbol
+> list. `WHERE id = <id>` is indexed; `WHERE name = '<name>'` is **not** — it
+> scans, unlike the equivalent on `functions`/`publics`. These tables are small
+> (hundreds of rows even on a multi-GB PDB), so a scan is cheap.
+
 ### Type Detail Tables
 
-#### udt_members
-Members of structs/classes/unions.
+#### udt_fields
+Data members of structs/classes/unions.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -214,22 +242,67 @@ Members of structs/classes/unions.
 | `udt_name` | TEXT | Parent UDT name |
 | `id` | INT | Member ID |
 | `name` | TEXT | Member name |
-| `type` | TEXT | Member type |
-| `offset` | INT | Offset within parent |
+| `type` | TEXT | Member type (`int`, `const char*`, `Foo[16]`, …) |
+| `offset` | INT | Byte offset within the parent |
 | `length` | INT | Member size |
-| `access` | INT | Access modifier (DIA enum: 1=private, 2=protected, 3=public) |
-| `is_static` | INT | 1 if static member |
-| `is_virtual` | INT | 1 if virtual member |
+| `access` | TEXT | `private` \| `protected` \| `public` |
+| `is_static` | INT | 1 if a static data member |
+
+#### udt_methods
+Member functions of structs/classes/unions.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `udt_id` | INT | Parent UDT ID |
+| `udt_name` | TEXT | Parent UDT name |
+| `id` | INT | Member ID |
+| `name` | TEXT | Method name |
+| `type` | TEXT | Rendered signature, e.g. `double (void)` |
+| `length` | INT | Code size, when the record carries one |
+| `access` | TEXT | `private` \| `protected` \| `public` |
+| `is_static` | INT | 1 if a static member function |
+| `is_virtual` | INT | 1 if virtual |
+| `is_pure` | INT | 1 if pure virtual (`= 0`) |
+
+> **Fields and methods are separate tables so every column means something on
+> every row.** A field always has an offset; a method never does, and only a
+> method can be virtual. There is no `kind` discriminator and no
+> NULL-half-the-time `offset`.
+>
+> For "all members of X", `UNION ALL` them explicitly:
+>
+> ```sql
+> SELECT name, type, 'field'  AS kind FROM udt_fields  WHERE udt_name = 'MyClass'
+> UNION ALL
+> SELECT name, type, 'method' AS kind FROM udt_methods WHERE udt_name = 'MyClass';
+> ```
+>
+> Methods typically outnumber fields ~7:1 on a large C++ PDB, so don't reach for
+> the union unless you actually want both.
+>
+> For virtual **inheritance** (not virtual methods), use `base_classes.is_virtual`.
 
 ```sql
--- Members of a specific struct
+-- Memory layout of a struct
 SELECT name, offset, length, type
-FROM udt_members
+FROM udt_fields
 WHERE udt_name = 'MyStruct'
 ORDER BY offset;
 
--- Find all pointer members
-SELECT udt_name, name FROM udt_members WHERE type LIKE '%*%';
+-- The virtual interface of a class
+SELECT name, type, is_pure
+FROM udt_methods
+WHERE udt_name = 'MyClass' AND is_virtual = 1;
+
+-- Abstract classes (have at least one pure virtual)
+SELECT DISTINCT udt_name FROM udt_methods WHERE is_pure = 1;
+
+-- Public API surface of a class
+SELECT name, type FROM udt_methods
+WHERE udt_name = 'MyClass' AND access = 'public';
+
+-- Find all pointer fields
+SELECT udt_name, name FROM udt_fields WHERE type LIKE '%*%';
 ```
 
 #### enum_values
@@ -261,20 +334,46 @@ Base class relationships (C++ inheritance).
 | `is_virtual` | INT | 1 if virtual inheritance |
 | `access` | INT | Access modifier (DIA enum: 1=private, 2=protected, 3=public) |
 
-```sql
--- Find all derived classes of a base
-SELECT derived_name FROM base_classes WHERE base_name = 'IUnknown';
+> **Walk hierarchies UPWARD (derived → base). This is a hard rule, not a tuning tip.**
+>
+> DIA records what a class *derives from* and offers **no reverse lookup**, so only
+> the child→parent direction can be indexed:
+>
+> | Predicate | Cost |
+> |---|---|
+> | `WHERE derived_id = <id>` | indexed — instant |
+> | `WHERE derived_name = '<name>'` | indexed — instant |
+> | `WHERE base_name = '<name>'` | **full table scan** |
+> | `WHERE base_id = <id>` | **full table scan** |
+>
+> A recursive CTE that walks *downward* (`base_name` → subclasses) re-scans the
+> whole table at **every** recursion step. On a large PDB one such scan costs
+> minutes, so a downward walk is effectively unusable. Seed from the derived class
+> and traverse toward its bases.
 
--- Inheritance hierarchy
-WITH RECURSIVE hierarchy AS (
-  SELECT derived_name, base_name, 0 as depth FROM base_classes WHERE derived_name = 'MyClass'
+```sql
+-- Ancestors of a class (indexed at every step)
+WITH RECURSIVE ancestors(derived, base, depth) AS (
+  SELECT derived_name, base_name, 1
+  FROM base_classes
+  WHERE derived_name = 'MyClass'
+
   UNION ALL
-  SELECT bc.derived_name, bc.base_name, h.depth + 1
+
+  SELECT bc.derived_name, bc.base_name, a.depth + 1
   FROM base_classes bc
-  JOIN hierarchy h ON bc.derived_name = h.base_name
-  WHERE h.depth < 5
+  JOIN ancestors a ON bc.derived_name = a.base      -- upward: derived_name is indexed
+  WHERE a.depth < 8
 )
-SELECT * FROM hierarchy;
+SELECT DISTINCT base, depth FROM ancestors ORDER BY depth;
+
+-- Direct bases of one class
+SELECT base_name, offset, is_virtual, access
+FROM base_classes WHERE derived_name = 'MyClass';
+
+-- Find all derived classes of a base -- SCANS the table. Fine as a ONE-OFF query;
+-- never put this shape inside a recursive CTE or a per-row join.
+SELECT derived_name FROM base_classes WHERE base_name = 'IUnknown';
 ```
 
 ### Compilation Unit Tables
@@ -385,8 +484,9 @@ Local variables within functions.
 | `id` | INT | Variable ID |
 | `name` | TEXT | Variable name |
 | `type` | TEXT | Variable type |
-| `location_type` | INT | DIA location enum (0=null, 1=static, 2=regrel, 4=enregistered, etc.) |
-| `offset_or_register` | INT | Stack offset (when location_type=regrel) or register number (when enregistered) |
+| `location` | TEXT | `static` \| `regrel` \| `thisrel` \| `register` \| `tls` \| … |
+| `frame_offset` | INT | Frame-relative offset, **NULL** when not frame-relative |
+| `register` | INT | Register number, **NULL** when not register-based |
 
 ```sql
 -- SLOW: Scans all functions
@@ -412,8 +512,10 @@ Function parameters.
 | `id` | INT | Parameter ID |
 | `name` | TEXT | Parameter name |
 | `type` | TEXT | Parameter type |
-| `location_type` | INT | DIA location enum |
-| `offset_or_register` | INT | Stack offset or register number (per location_type) |
+| `ordinal` | INT | 0-based position in the signature — **`ORDER BY ordinal`** |
+| `location` | TEXT | `static` \| `regrel` \| `thisrel` \| `register` \| … |
+| `frame_offset` | INT | Frame-relative offset, **NULL** when not frame-relative |
+| `register` | INT | Register number, **NULL** when not register-based |
 
 ```sql
 -- Parameters of a specific function
@@ -463,7 +565,7 @@ SELECT undecorated, rva FROM functions WHERE undecorated LIKE '%vector%';
 ```sql
 -- Find all structs with a specific member
 SELECT DISTINCT udt_name
-FROM udt_members
+FROM udt_fields
 WHERE name = 'dwSize';
 
 -- Struct size distribution
@@ -529,19 +631,30 @@ ORDER BY total_code_size DESC;
 ### Type Hierarchy
 
 ```sql
--- All classes implementing an interface
-WITH RECURSIVE derived AS (
-  SELECT derived_name, base_name, 1 as level
-  FROM base_classes WHERE base_name = 'IUnknown'
+-- Full ancestor chain of a class, with the depth at which each base appears.
+-- Walks UPWARD via derived_name, which is indexed at every step (see base_classes).
+WITH RECURSIVE ancestors(derived, base, level) AS (
+  SELECT derived_name, base_name, 1
+  FROM base_classes WHERE derived_name = 'MyClass'
 
   UNION ALL
 
-  SELECT bc.derived_name, bc.base_name, d.level + 1
+  SELECT bc.derived_name, bc.base_name, a.level + 1
   FROM base_classes bc
-  JOIN derived d ON bc.base_name = d.derived_name
-  WHERE d.level < 10
+  JOIN ancestors a ON bc.derived_name = a.base
+  WHERE a.level < 10
 )
-SELECT DISTINCT derived_name, level FROM derived ORDER BY level, derived_name;
+SELECT DISTINCT base, level FROM ancestors ORDER BY level, base;
+```
+
+To go the other way — *"everything implementing `IUnknown`"* — there is no indexed
+path (DIA has no reverse lookup), so do it as a **single bounded scan** rather than
+a recursive walk:
+
+```sql
+-- Direct subclasses only: ONE scan. A recursive version multiplies that scan by
+-- every level and is not viable on a large PDB.
+SELECT DISTINCT derived_name FROM base_classes WHERE base_name = 'IUnknown';
 ```
 
 ### Section Distribution
@@ -609,7 +722,11 @@ knowing them lets you pick fast queries and avoid the one slow pattern.
   region can take 10+ seconds even for a modest window with a normal row count
   (measured: a 0x10000-byte window returning 1,834 rows took ~14s in one region,
   vs ~8ms for a similar-sized/row-count window elsewhere) — and it does NOT warm
-  up on repeat, unlike a flat `rva=` lookup. **`X-XSQL-Timeout`/`--query-timeout`/
+  up on repeat, unlike a flat `rva=` lookup. **The effect is size-dependent**: that
+  ~14s worst case was on a 3.14 GB / 1.31M-function PDB, while a sweep of eleven
+  equal-width windows across a 131 MB / 93k-function PDB found *no* cliff at all
+  (every window 3–10 ms). Expect it on multi-GB PDBs; don't design around it on
+  small ones. **`X-XSQL-Timeout`/`--query-timeout`/
   `POST /cancel` cannot bound or abort this**: they are all checked between rows,
   but the entire cost is paid inside the single seek call before the first row is
   ever emitted, so there is no row boundary to interrupt at. A stalled range query
@@ -642,6 +759,22 @@ Over HTTP you can bound a single request with the header `X-XSQL-Timeout: <ms>`
 (`0` = no limit), independent of the server default. To stop an **already-running**
 query, send `POST /cancel` from another connection — the in-flight query returns its
 partial rows; a client that drops a streamed connection mid-flight cancels it too.
+
+**Detect this in code, not by string-matching the prose.** A truncated statement
+reports `"partial": true` and carries the human-readable text in `warnings[]`:
+
+```json
+{ "success": true,
+  "results": [ { "success": true, "row_count": 1258, "elapsed_ms": 25,
+                 "error": null, "partial": true,
+                 "warnings": ["query timed out; returning partial rows"] } ] }
+```
+
+Branch on `results[].partial`. Note that `success` stays `true` — partial results
+are a success carrying fewer rows, not an error. The one exception is a statement
+whose rows only materialize at completion (an unqualified `COUNT(*)`, say): it has
+no partial rows to return, so it comes back `success: false` with
+`error: "Query timed out"` and `partial: false`.
 
 ### Use equality filters and bounded output
 
@@ -730,19 +863,34 @@ The `language` column in `compilands` uses CV_CFL_* constants:
 | 15 | MSIL |
 | 16 | HLSL |
 
+`language` is **NULL** when the compiland reports none — roughly 10% of compilands
+on a real shipping PDB carry no language record at all. It cannot be 0-for-unknown,
+because 0 is a real value meaning C.
+
 ```sql
--- Count by language
+-- Count by language (NULL = the compiland records no language)
 SELECT
-  CASE language
-    WHEN 0 THEN 'C'
-    WHEN 1 THEN 'C++'
-    WHEN 2 THEN 'Fortran'
+  CASE
+    WHEN language IS NULL THEN 'unknown'   -- must be the searched form, see below
+    WHEN language = 0 THEN 'C'
+    WHEN language = 1 THEN 'C++'
+    WHEN language = 2 THEN 'Fortran'
+    WHEN language = 3 THEN 'MASM'
+    WHEN language = 7 THEN 'LINK'
+    WHEN language = 8 THEN 'CVTRES'
     ELSE 'Other'
   END as lang,
   COUNT(*) as count
 FROM compilands
-GROUP BY language;
+GROUP BY lang
+ORDER BY count DESC;
 ```
+
+> ⚠️ Use the **searched** `CASE WHEN language IS NULL`, never the simple form
+> `CASE language WHEN NULL THEN ...`. The simple form compares with `=`, and
+> `NULL = NULL` is never true in SQL, so that branch silently never fires and the
+> unknown rows fall through to `ELSE`. The same trap applies to every nullable
+> column here: `udts.name`, `parameters.frame_offset`, `parameters.register`.
 
 ---
 
@@ -813,9 +961,12 @@ GROUP BY type;
 |------|------------|
 | List all functions | `functions` |
 | Find types | `udts`, `enums`, `typedefs` |
-| Type members | `udt_members` |
+| Top-N / distinct types | `udts`, `enums` (already deduplicated) |
+| Per-compiland type records | `udt_records`, `enum_records` |
+| Struct layout / data members | `udt_fields` |
+| Methods / virtuals | `udt_methods` |
 | Enum values | `enum_values` |
-| Inheritance | `base_classes` |
+| Inheritance (upward) | `base_classes WHERE derived_name = X` |
 | Source files | `source_files` |
 | Line mapping | `line_numbers` |
 | Compilands | `compilands` |
@@ -827,29 +978,153 @@ GROUP BY type;
 
 ---
 
+## Troubleshooting startup failures
+
+| Message | Cause | Fix |
+|---|---|---|
+| `Failed to create DiaSource: the DIA COM class is not registered ... and no usable msdia140.dll was found` | Neither COM registration nor a loadable `msdia140.dll` on disk | Install the Visual Studio C++ tools, drop `msdia140.dll` next to `pdbsql.exe`, or `regsvr32 "<VS>\DIA SDK\bin\amd64\msdia140.dll"` |
+| `Failed to load PDB: ... not a DIA-readable PDB` | The file isn't an MSVC-emitted PDB | DIA cannot read LLVM/clang-emitted PDBs. Rebuild with MSVC, or use a different tool for that PDB |
+| `Failed to load PDB: ... file not found or inaccessible` | Bad path or permissions | Check the path |
+| `Failed to load PDB: ... signature/age mismatch` | PDB doesn't match its binary | Get the matching PDB |
+
+pdbsql tries normal COM activation first, then falls back to loading
+`msdia140.dll` directly (no registry write, no admin), so a machine with the SDK
+present but unregistered works out of the box. Every failure carries its raw
+`HRESULT` for reporting.
+
+---
+
 ## Example Workflows
 
 ### Reverse Engineer a Type
 
 ```sql
--- 1. Find the type
-SELECT * FROM udts WHERE name LIKE '%MyClass%';
+-- 1. Find the type (deduplicated -- `udts` repeats a name per defining compiland)
+SELECT name, length FROM udts WHERE name LIKE '%MyClass%';
 
--- 2. Get its members
+-- 2. Its memory layout -- data members only, so `offset` is meaningful
 SELECT name, offset, length, type
-FROM udt_members
+FROM udt_fields
 WHERE udt_name = 'MyClass'
 ORDER BY offset;
 
--- 3. Check base classes
-SELECT base_name FROM base_classes WHERE derived_name = 'MyClass';
+-- 3. Its interface -- member functions, with the virtual/pure flags
+SELECT name, type, is_virtual, is_pure, is_static
+FROM udt_methods
+WHERE udt_name = 'MyClass'
+ORDER BY is_virtual DESC, name;
 
--- 4. Find functions using this type
-SELECT f.name
+-- 4. Its ancestors (walk upward -- the indexed direction)
+WITH RECURSIVE anc(derived, base, depth) AS (
+  SELECT derived_name, base_name, 1 FROM base_classes WHERE derived_name = 'MyClass'
+  UNION ALL
+  SELECT bc.derived_name, bc.base_name, a.depth + 1
+  FROM base_classes bc JOIN anc a ON bc.derived_name = a.base WHERE a.depth < 8
+)
+SELECT DISTINCT base, depth FROM anc ORDER BY depth;
+
+-- 5. Functions that touch it (type strings resolve, including pointers/refs)
+SELECT DISTINCT f.name
 FROM functions f
 JOIN locals l ON f.id = l.func_id
 WHERE l.type LIKE '%MyClass%';
 ```
+
+### Map the polymorphic surface
+
+`is_virtual` / `is_pure` live on `udt_methods`.
+
+```sql
+-- Classes ranked by how much virtual surface they expose
+SELECT udt_name, COUNT(*) AS virtuals, SUM(is_pure) AS pure
+FROM udt_methods
+WHERE is_virtual = 1
+GROUP BY udt_name
+ORDER BY virtuals DESC
+LIMIT 20;
+
+-- Abstract classes / interfaces: anything with a pure virtual
+SELECT DISTINCT udt_name FROM udt_methods WHERE is_pure = 1 ORDER BY udt_name;
+
+-- One class's vtable-facing API
+SELECT name, type, is_pure
+FROM udt_methods
+WHERE udt_name = 'MyClass' AND is_virtual = 1;
+```
+
+### Find every user of a type (type-string search)
+
+Parameter, local and member type strings are built structurally, so pointers,
+references, arrays and basic types all render (`const char*`, `MyClass&`,
+`int[16]`, `double (void)`) and are searchable with `LIKE`.
+
+```sql
+-- Every function taking a pointer to this type
+SELECT DISTINCT f.name, p.name AS param, p.type
+FROM parameters p JOIN functions f ON f.id = p.func_id
+WHERE p.type LIKE '%MyClass%*';
+
+-- Structs embedding it by value
+SELECT udt_name, name FROM udt_fields WHERE type = 'MyClass';
+
+-- Raw-buffer smells: char/byte arrays inside structs
+SELECT udt_name, name, type, length FROM udt_fields
+WHERE type LIKE 'char[%' OR type LIKE 'unsigned char[%'
+ORDER BY length DESC LIMIT 20;
+```
+
+### Toolchain forensics (per translation unit)
+
+`compilands.language` reports the real per-TU source language (NULL when the
+compiland records none).
+
+```sql
+-- What was this binary actually built from? (searched CASE -- see Language Codes)
+SELECT CASE WHEN language IS NULL THEN 'unknown'
+            WHEN language = 0 THEN 'C'    WHEN language = 1 THEN 'C++'
+            WHEN language = 3 THEN 'MASM' WHEN language = 7 THEN 'LINK'
+            WHEN language = 8 THEN 'CVTRES'
+            ELSE 'other(' || language || ')' END AS lang,
+       COUNT(*) AS tus
+FROM compilands GROUP BY lang ORDER BY tus DESC;
+
+-- Hand-written assembly TUs (often crypto / intrinsics / hot loops)
+SELECT name FROM compilands WHERE language = 3;
+
+-- Third-party static libs linked in
+SELECT library, COUNT(*) AS tus FROM compilands
+WHERE library <> '' GROUP BY library ORDER BY tus DESC LIMIT 20;
+```
+
+### Data and header budget
+
+`data.length` resolves through the symbol's type, so global sizes are real.
+
+```sql
+-- Largest global/static data
+SELECT name, length FROM data ORDER BY length DESC LIMIT 20;
+
+-- Header bloat: which types are compiled into the most translation units?
+SELECT name, COUNT(*) AS tus FROM udt_records
+WHERE name IS NOT NULL GROUP BY name ORDER BY tus DESC LIMIT 20;
+```
+
+### Import stubs and jump thunks
+
+`thunks` enumerates per compiland (tens of thousands on a large binary).
+
+```sql
+SELECT name, printf('0x%X', rva) AS addr, length FROM thunks
+ORDER BY length DESC LIMIT 20;
+
+-- Thunks clustered by section (import tables vs inline jump stubs)
+SELECT section, COUNT(*) AS n, SUM(length) AS bytes
+FROM thunks GROUP BY section ORDER BY n DESC;
+```
+
+> `symbol_at()` takes a **literal** address, not a column: it cannot be joined as
+> `JOIN symbol_at(t.rva)`. To resolve a thunk's neighbourhood, read the rva first
+> and issue `SELECT * FROM symbol_at(<that value>)` as a second query.
 
 ### Analyze Code Coverage
 
@@ -869,7 +1144,8 @@ LIMIT 20;
 ### Find Unused Types
 
 ```sql
--- Types not referenced in locals or parameters
+-- Types not referenced in locals or parameters. `udts` is already deduplicated,
+-- so each unused type is reported once.
 SELECT u.name
 FROM udts u
 WHERE NOT EXISTS (
@@ -880,6 +1156,10 @@ AND NOT EXISTS (
 )
 ORDER BY u.name;
 ```
+
+> This is a whole-table scan of `locals` and `parameters` per candidate type — fine
+> on a small PDB, very slow on a multi-GB one. Bound it with a `LIMIT` on the
+> candidate set first.
 
 ---
 

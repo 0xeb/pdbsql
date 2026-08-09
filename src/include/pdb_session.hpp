@@ -48,32 +48,50 @@ public:
     bool open(const std::string& pdb_path) {
         close();
 
-        // Create DiaDataSource
+        // Create DiaDataSource. Try normal COM activation first so a machine with a
+        // registered msdia keeps using it, then fall back to loading the DLL
+        // directly -- the SDK is frequently present while the COM class is not
+        // registered (registering it needs admin).
         HRESULT hr = source_.CoCreateInstance(CLSID_DiaSource);
         if (FAILED(hr)) {
-            last_error_ = "Failed to create DiaSource";
-            return false;
+            std::wstring loaded_from;
+            const HRESULT regfree_hr = create_dia_source_regfree(source_, &loaded_from);
+            if (FAILED(regfree_hr)) {
+                if (hr == REGDB_E_CLASSNOTREG) {
+                    last_error_ =
+                        "Failed to create DiaSource: the DIA COM class is not registered (" +
+                        hresult_to_string(hr) +
+                        ") and no usable msdia140.dll was found to load directly (" +
+                        hresult_to_string(regfree_hr) +
+                        "). Install the Visual Studio C++ tools, place msdia140.dll next to this "
+                        "executable, or register it with: regsvr32 \"<VS>\\DIA SDK\\bin\\amd64\\msdia140.dll\"";
+                } else {
+                    last_error_ = "Failed to create DiaSource (" + hresult_to_string(hr) + ")";
+                }
+                return false;
+            }
         }
 
         // Load PDB
         std::wstring wpath = string_to_wstring(pdb_path);
         hr = source_->loadDataFromPdb(wpath.c_str());
         if (FAILED(hr)) {
-            last_error_ = "Failed to load PDB: " + pdb_path;
+            last_error_ = "Failed to load PDB: " + pdb_path + " -- " +
+                          describe_pdb_load_error(hr) + " (" + hresult_to_string(hr) + ")";
             return false;
         }
 
         // Open session
         hr = source_->openSession(&session_);
         if (FAILED(hr)) {
-            last_error_ = "Failed to open session";
+            last_error_ = "Failed to open session (" + hresult_to_string(hr) + ")";
             return false;
         }
 
         // Get global scope
         hr = session_->get_globalScope(&global_);
         if (FAILED(hr)) {
-            last_error_ = "Failed to get global scope";
+            last_error_ = "Failed to get global scope (" + hresult_to_string(hr) + ")";
             return false;
         }
 
