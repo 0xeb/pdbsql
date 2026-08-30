@@ -39,10 +39,23 @@ target_link_libraries(pdbsql PRIVATE
     ws2_32
 )
 
+# The embedded agent reference (pdbsql_agent_prompt / _gen) is defined in the
+# top-level pdbsql/CMakeLists.txt whenever HTTP or MCP is on -- both server
+# modes serve it (GET /help and the pdbsql_help MCP tool).
+if(PDBSQL_WITH_HTTP OR PDBSQL_WITH_MCP)
+    target_link_libraries(pdbsql PRIVATE pdbsql_agent_prompt)
+    add_dependencies(pdbsql pdbsql_agent_prompt_gen)
+endif()
+
 # MCP server support
 if(PDBSQL_WITH_MCP)
     target_link_libraries(pdbsql PRIVATE fastmcpp_core)
-    target_compile_definitions(pdbsql PRIVATE PDBSQL_HAS_MCP)
+    # PDBSQL_VERSION_STRING is what the MCP handler reports to a connecting
+    # agent. Derived from project(pdbsql VERSION ...) so it cannot drift from
+    # the single source of truth scripts/check-version.py enforces.
+    target_compile_definitions(pdbsql PRIVATE
+        PDBSQL_HAS_MCP
+        PDBSQL_VERSION_STRING="${PROJECT_VERSION}")
     target_include_directories(pdbsql PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
     message(STATUS "pdbsql CLI: MCP server support enabled")
 endif()
@@ -53,6 +66,8 @@ if(PDBSQL_WITH_HTTP)
     target_sources(pdbsql PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../common/http_server.cpp
     )
-    target_include_directories(pdbsql PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+    target_include_directories(pdbsql PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../common
+    )
     message(STATUS "pdbsql CLI: HTTP server support enabled")
 endif()

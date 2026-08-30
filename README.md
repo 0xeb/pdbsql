@@ -33,18 +33,25 @@ No SDK. No scripting runtime. Just SQL.
 | `functions` | All functions with name, RVA, size, signature |
 | `symbol_at(addr)` | TVF: innermost symbol *containing* an address (fast addr→symbol) |
 | `publics` | Public symbols (exports, decorated names) |
-| `udts` | Structs, classes, unions with size and member count |
-| `udt_members` | Fields: offset, type, bit position |
-| `enums` | Enumerations |
+| `udts` | Structs, classes, unions, deduplicated by default (size, member count) |
+| `udt_records` | Raw per-compiland UDT rows behind the `udts` dedup |
+| `udt_fields` | Data members: offset, type, bit position |
+| `udt_methods` | Member functions: signature, `is_virtual`/`is_pure` |
+| `enums` | Enumerations, deduplicated by default |
+| `enum_records` | Raw per-compiland enum rows behind the `enums` dedup |
 | `enum_values` | Enum members with values |
 | `typedefs` | Type aliases |
 | `data` | Global/static variables |
+| `thunks` | Thunk symbols (import stubs, jump thunks) |
+| `labels` | Label symbols |
+| `base_classes` | Class inheritance (base/derived, offset) |
 | `sections` | PE sections (.text, .data, .rdata) |
 | `compilands` | Object files / translation units |
 | `source_files` | Source file paths |
 | `line_numbers` | Address-to-source mappings |
 | `locals` | Local variables (per function) |
 | `parameters` | Function parameters |
+| `runtime_settings` | Writable: session controls (e.g. `query_timeout_ms`) |
 
 ## Quick Start
 
@@ -80,9 +87,16 @@ pdbsql test.pdb -q "SELECT name,rva,length FROM functions" --format jsonl -o fun
 # pulls the expensive undecorated column, so prefer explicit columns for a fast pull).
 pdbsql test.pdb --dump sections --format csv -o sections.csv --quiet
 ```
-`WHERE rva = <addr>` and `WHERE name = '<exact>'` are indexed lookups (fast addr→name);
-only substring `name LIKE '%…%'` is a full walk. Selecting `undecorated` (the demangled
-name) is the one expensive column — omit it for a fast bulk pull.
+The CLI export streams to disk and is the simplest path for a one-off; a warm
+server is better when you export repeatedly (it skips process start and the
+one-time table warm-up, producing a byte-identical file).
+
+`WHERE rva = <addr>` and `WHERE name = '<exact>'` are indexed lookups; substring
+`name LIKE '%…%'` is a full walk. Selecting `undecorated` (the demangled name) is
+the one expensive column — omit it for a fast bulk pull. That fixes the *time*
+cost, not memory: a full walk of a large symbol table permanently commits several
+GB regardless of which columns you select. Fine for a short-lived export; budget
+for it if the process stays up.
 
 **Interactive mode:**
 ```bash
@@ -100,8 +114,9 @@ pdbsql test.pdb --http 8080 --token secret123
 # Terminal 2: Query over HTTP
 curl -X POST http://localhost:8080/query -H "Authorization: Bearer secret123" -d "SELECT * FROM sections"
 
-# Stream a large result row-by-row (chunked, flat memory, early first byte).
-# Use curl -N so the client does not buffer the whole response.
+# Stream a large result row-by-row: first byte in milliseconds and flat server
+# memory, instead of waiting for the whole query and buffering it. Total time can
+# be slightly higher than buffered. Use curl -N or the client will buffer anyway.
 curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: 1" -d "SELECT name FROM publics"
 
 # Bound a single request (ms; 0 = no limit), independent of the server default
@@ -111,30 +126,68 @@ curl -X POST http://localhost:8080/query -H "X-XSQL-Timeout: 5000" -d "SELECT na
 curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: ndjson" -d "SELECT name,rva FROM functions"
 ```
 
-**Streaming: verified, and its actual tradeoff.** Measured with `curl -N -w
-"%{time_starttransfer} %{time_total}"` on a large (multi-gigabyte, million-symbol)
-PDB: streamed NDJSON delivers the **first byte in a few milliseconds**, regardless of
-result size (vs the buffered response, which only replies once the whole query
-finishes) — the low-memory, early-first-byte guarantee holds. But **total wall-clock
-to receive everything was noticeably higher streamed than buffered** in that same
-test — chunked per-row delivery has real per-write overhead a single buffered
-response doesn't pay. Use streaming when you want to start processing rows
-immediately or keep server/client memory flat on a huge pull; use the plain buffered
-response when the result comfortably fits in memory and you just want it as fast as
-possible. `curl -s` (without `-N`) will report the buffered response's timing even
-with `X-XSQL-Stream` set, because `curl` itself buffers output without `-N` — always
-use `-N` to observe real streaming behavior client-side.
+> **Queries are serialized — one slow query blocks every other client.** The DIA
+> session is not thread-safe, so the server runs queries **one at a time**: a
+> millisecond query issued during a long scan waits its turn. On a multi-GB PDB an
+> unscoped query can run for minutes, making it a server-wide stall. **Always
+> bound queries** (`--query-timeout` at startup, or per-request `X-XSQL-Timeout`),
+> and run long unscoped scans on a separate instance.
+>
+> `/status` and `/help` bypass the query executor, so health checks stay
+> responsive — a green `/status` does not prove the server can answer a query.
 
-**Bounded address-range queries** (`WHERE rva > X AND rva < Y` on `functions`/
-`publics`) are index-backed but not O(1): cost depends on *where* the window lands,
-not its width or row count — most windows resolve in single-digit milliseconds, but
-one landing in an unlucky address region can take 10+ seconds (measured: a
-0x10000-byte window returning ~1,800 rows took ~14s in one region vs ~8ms for a
-similar window elsewhere), and it does not warm up on repeat. `X-XSQL-Timeout` and
-`POST /cancel` cannot bound or abort a stalled range query — the entire cost is paid
-inside a single call before the first row is emitted, so there's no row boundary to
-interrupt at; a stall's only recovery is restarting the server. Use range queries for
-a known address window, not as a general-purpose scan.
+> **Bulk symbolization: batch the addresses.** `symbol_at` accepts a correlated
+> argument, so a whole address list resolves in one query — roughly **17x** the
+> throughput of one request per address. Two traps: send `Content-Type:
+> text/plain` (the form-urlencoded default returns a misleading **HTTP 413** past
+> ~8 KB), and use `json_each`, not `UNION ALL` (which caps at 500 terms and
+> reports the failure *inside* an HTTP 200).
+>
+> ```bash
+> curl -N -X POST http://localhost:8080/query -H "Content-Type: text/plain" -d \
+>   "WITH addrs(a) AS (SELECT value FROM json_each('[4198400,4198512]'))
+>    SELECT a, (SELECT name FROM symbol_at(a)) FROM addrs"
+> ```
+
+> **Memory: budget several GB for a fully-exercised server on a multi-GB PDB.**
+> DIA caches symbols per session as queries touch them, so RSS grows with what you
+> query and then **converges** — it does not leak. The first scan of any table
+> pays a large shared base-index cost (a small table triggers it just as a large
+> one does), and the UDT/Enum tables are by far the most expensive; everything
+> after is essentially free, including repeat scans. A server that never queries
+> UDT/Enum tables settles substantially lower. Buffered (non-streaming) responses
+> add a transient on top.
+
+**Serving a large PDB: move the warm-up to startup.** DIA builds its indexes
+*lazily*, on the first query that touches a given path, so the first request of
+each kind pays a large one-time cost that later identical requests do not. A
+long-lived server should pay that at boot rather than charging it to whichever
+request arrives first:
+
+```bash
+# Pre-enumerate the listed tables at startup (also works with --mcp)
+pdbsql big.pdb --http 8080 --warm-tables functions,publics,udts
+
+# Pay the line_numbers file_id index cost (10-18s on a large PDB) at startup
+pdbsql big.pdb --http 8080 --warm-file-index
+```
+
+Valid `--warm-tables` names: `functions`, `publics`, `data`, `udts`,
+`typedefs`, `enums`, `compilands`.
+
+> **A warm-up cannot be interrupted by a timeout.** It produces no rows, so
+> nothing polls the deadline — an `X-XSQL-Timeout` on a cold first query
+> reports the warm-up cost rather than the budget you asked for, and the
+> query can appear to ignore its timeout when it is in fact working
+> correctly. The work is never wasted (even a timed-out first query leaves
+> the index built), so raise the bound for the first query rather than
+> retrying it hoping for a cheaper outcome — or pre-warm at startup as above.
+
+**Bounded address-range queries** (`WHERE rva > X AND rva < Y` on
+`functions`/`publics`) are index-backed but not O(1): cost depends on *where* the
+window lands, not its width — the same width can cost milliseconds in one region
+and seconds in another, and it does not warm up on repeat. Use them for a known
+address window, not as a general-purpose scan.
 
 ```bash
 # Cancel the in-flight query from another connection (it returns its partial rows)
@@ -159,7 +212,18 @@ pdbsql test.pdb --http 8080 --query-timeout 30
 pdbsql test.pdb --mcp
 pdbsql test.pdb --mcp 9123
 ```
-The MCP server exposes a single tool, `pdbsql_query`, that runs SQL directly against the PDB.
+The MCP server exposes two tools:
+
+| tool | purpose |
+|---|---|
+| `pdbsql_query` | Run SQL directly against the PDB. |
+| `pdbsql_help` | Return the complete pdbsql reference — every table and column, the query patterns that push down, and the performance traps on large PDBs. Takes no arguments. |
+
+`pdbsql_help` returns the same document [`prompts/pdbsql_agent.md`](prompts/pdbsql_agent.md)
+that HTTP mode serves from `GET /help`; it is compiled into the binary, so the two
+can never drift from the file. **An MCP client should call `pdbsql_help` before
+writing queries** — on a large PDB the difference between a guided and an unguided
+query is minutes, and a few documented query shapes do not complete at all.
 
 ## Using pdbsql with an AI agent
 
@@ -172,8 +236,12 @@ tool two ways:
   table and column, and worked query patterns, so the model can translate
   natural-language questions into pdbsql SQL and run them via `-q` / `--http` / `--mcp`.
 - **Over MCP:** start `pdbsql file.pdb --mcp` and connect any MCP client (see MCP server
-  mode above). The client's own model does the reasoning; pdbsql exposes the
-  `pdbsql_query` tool that executes SQL against the PDB.
+  mode above). The client's own model does the reasoning; pdbsql exposes
+  `pdbsql_query` to execute SQL and `pdbsql_help` to fetch the same reference on
+  demand — so an MCP client does **not** need the system-prompt step above, it can
+  pull the document itself.
+- **Over HTTP:** `GET /help` returns the REST mechanics followed by that same
+  reference.
 
 ## Real-World Examples
 
@@ -205,7 +273,7 @@ GROUP BY sf.filename, c.name;
 -- Virtual function tables (C++ RE)
 SELECT u.name, COUNT(m.id) as vtable_size
 FROM udts u
-JOIN udt_members m ON u.id = m.udt_id
+JOIN udt_fields m ON u.id = m.udt_id
 WHERE m.name LIKE '%vftable%'
 GROUP BY u.name;
 ```

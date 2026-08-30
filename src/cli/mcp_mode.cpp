@@ -16,9 +16,11 @@
 #include <xsql/database.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 static std::atomic<bool> g_mcp_quit{false};
 
@@ -28,7 +30,8 @@ static void mcp_signal_handler(int) {
 
 // Serve the pdbsql_query MCP tool over SSE until Ctrl+C. The SSE server calls the
 // query callback on its own thread; use_queue=true drains commands on this thread.
-int run_mcp_mode(const std::string& pdb_path, int port, const std::string& bind_addr) {
+int run_mcp_mode(const std::string& pdb_path, int port, const std::string& bind_addr,
+                 bool warm_file_index, const std::vector<std::string>& warm_tables) {
     pdbsql::PdbSession session;
     if (!session.open(pdb_path)) {
         fprintf(stderr, "Error: %s\n", session.last_error().c_str());
@@ -36,6 +39,35 @@ int run_mcp_mode(const std::string& pdb_path, int port, const std::string& bind_
     }
 
     printf("PDBSQL MCP Server - Loaded: %s\n", pdb_path.c_str());
+
+    // See run_http_mode's identical block (http_mode.cpp) for the full
+    // rationale: an opt-in one-time DIA index warm-up for line_numbers'
+    // WHERE file_id=X pushdown, paid at startup instead of on whichever
+    // client's query touches it first.
+    if (warm_file_index) {
+        printf("Warming line_numbers file_id index...\n");
+        fflush(stdout);
+        const auto warm_t0 = std::chrono::steady_clock::now();
+        session.ensure_file_index_warm();
+        const double warm_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count();
+        printf("File index warm in %.2fs\n", warm_sec);
+    }
+
+    // See run_http_mode's identical block (http_mode.cpp) for the full
+    // rationale: an opt-in one-time DIA enumeration warm-up for each listed
+    // table, paid at startup instead of on whichever client's query
+    // touches it first.
+    for (const auto& table_name : warm_tables) {
+        auto tag = pdbsql::symtag_for_warmable_table_name(table_name);
+        printf("Warming %s table...\n", table_name.c_str());
+        fflush(stdout);
+        const auto warm_t0 = std::chrono::steady_clock::now();
+        session.ensure_symtag_warm(*tag);
+        const double warm_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count();
+        printf("%s table warm in %.2fs\n", table_name.c_str(), warm_sec);
+    }
 
     xsql::Database db;
     pdbsql::TableRegistry registry(session);

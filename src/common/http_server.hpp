@@ -6,12 +6,8 @@
 
 #pragma once
 
-/**
- * PdbsqlHTTPServer - HTTP REST server for PDBSQL REPL
- *
- * Thin wrapper over xsql::thinclient::http_query_server.
- * Preserves the existing API for backward compatibility.
- */
+// The live HTTP transport for `pdbsql --http`; thin wrapper over the shared
+// xsql::thinclient::http_query_server.
 
 #ifdef PDBSQL_HAS_HTTP
 
@@ -23,21 +19,33 @@
 
 namespace pdbsql {
 
-// Callback for handling SQL queries
-using HTTPQueryCallback = std::function<std::string(const std::string& sql)>;
+using HTTPQueryCallback = std::function<xsql::ScriptResult(
+    const std::string& sql, const xsql::ScriptOptions& options)>;
+
+using HTTPStreamSink = xsql::thinclient::http_query_server_config::stream_sink_t;
+
+// True chunked streaming: bounded-memory output (a live DIA cursor), not a
+// materialized ScriptResult.
+using HTTPStreamingCallback = std::function<void(
+    const std::string& sql, const xsql::ScriptOptions& options,
+    bool ndjson, const HTTPStreamSink& sink)>;
 
 class PdbsqlHTTPServer {
 public:
     PdbsqlHTTPServer() = default;
     ~PdbsqlHTTPServer() { stop(); }
 
-    // Non-copyable
     PdbsqlHTTPServer(const PdbsqlHTTPServer&) = delete;
     PdbsqlHTTPServer& operator=(const PdbsqlHTTPServer&) = delete;
 
+    // port 0 = random 8100-8999. streaming_cb is optional (chunked
+    // X-XSQL-Stream responses). Returns the actual port, or -1 on failure.
     int start(int port, HTTPQueryCallback query_cb,
               const std::string& bind_addr = "127.0.0.1",
-              bool use_queue = false);
+              bool use_queue = false,
+              const std::string& auth_token = "",
+              const std::string& pdb_path = "",
+              HTTPStreamingCallback streaming_cb = nullptr);
 
     void run_until_stopped();
     void stop();

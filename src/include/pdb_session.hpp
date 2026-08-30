@@ -9,6 +9,9 @@
 
 #include "dia_helpers.hpp"
 #include <memory>
+#include <optional>
+#include <set>
+#include <string>
 
 namespace pdbsql {
 
@@ -138,6 +141,39 @@ public:
         return result;
     }
 
+    // Find symbols by a DIA glob pattern (`*` = any run of chars, `?` = one
+    // char -- DIA's nsfRegularExpression is glob syntax, not real regex,
+    // despite the name). Used for `WHERE name LIKE ...` pushdown: DIA's own
+    // glob search over a name index is dramatically cheaper than a full
+    // client-side walk-and-compare on a large PDB (several times faster,
+    // same match count). Case-insensitive to match SQL LIKE's default
+    // semantics; the caller does not need an exact-superset guarantee here --
+    // libxsql's LIKE pushdown always leaves the constraint unconsumed
+    // (omit=0), so SQLite re-applies the real pattern to every returned row.
+    CComPtr<IDiaEnumSymbols> find_symbols_glob(const std::string& glob_pattern,
+                                                enum SymTagEnum symtag = SymTagNull) {
+        CComPtr<IDiaEnumSymbols> result;
+        if (global_) {
+            std::wstring wpattern = string_to_wstring(glob_pattern);
+            global_->findChildren(symtag, wpattern.c_str(), nsCaseInRegularExpression, &result);
+        }
+        return result;
+    }
+
+    // Same glob search, but over source file names (IDiaSession::findFile takes
+    // the identical name/compareFlags shape as IDiaSymbol::findChildren, so this
+    // mirrors find_symbols_glob() exactly). Used for `WHERE filename LIKE ...`
+    // pushdown on source_files. A null pCompiland searches across the whole PDB,
+    // same scope as SourceFileGenerator's unscoped walk.
+    CComPtr<IDiaEnumSourceFiles> find_files_glob(const std::string& glob_pattern) {
+        CComPtr<IDiaEnumSourceFiles> result;
+        if (session_) {
+            std::wstring wpattern = string_to_wstring(glob_pattern);
+            session_->findFile(nullptr, wpattern.c_str(), nsCaseInRegularExpression, &result);
+        }
+        return result;
+    }
+
     // Find the symbol at an RVA via DIA's native address index (findSymbolByRVA).
     // Cache-free: DIA owns the index, so this is a direct lookup, not a full walk.
     // findSymbolByRVA is containment-based (returns the symbol whose range contains
@@ -177,6 +213,99 @@ public:
         return count;
     }
 
+    // Resolve a source file by DIA's own uniqueId (the exact value pdbsql
+    // exposes as `source_files.id` / `line_numbers.file_id`, see
+    // extract_source_file()). findFileById(id) fails with E_INVALIDARG until
+    // DIA's internal file-id index has been populated by at least one prior
+    // findFile(compiland, ...) call PER COMPILAND in this session -- a
+    // single unscoped findFile(nullptr, ...) (what SourceFileGenerator does)
+    // is not enough. The warm-up walk costs seconds once; findFileById is
+    // then ~free for the life of the session, and get_compilands() +
+    // findLines(compiland, file) resolve one file's line records without
+    // visiting any other compiland. This is what makes `WHERE file_id = X`
+    // pushdown on `line_numbers` viable at all -- without it, findFileById on
+    // a cold session cannot be used, leaving only the full
+    // walk-every-compiland generator.
+    bool ensure_file_index_warm() {
+        if (file_index_warmed_) return true;
+        if (!session_ || !global_) return false;
+
+        CComPtr<IDiaEnumSymbols> compilands;
+        if (FAILED(global_->findChildren(SymTagCompiland, nullptr, nsNone, &compilands)) || !compilands) {
+            return false;
+        }
+        // Getting the per-compiland IDiaEnumSourceFiles enumerator and even
+        // draining it via Next() is NOT enough to populate DIA's file-id
+        // index -- empirically, findFileById still fails afterward. Only
+        // calling get_uniqueId() on each returned IDiaSourceFile (as
+        // SourceFileGenerator/extract_source_file() already do for every row
+        // of a `source_files` scan) actually interns the id, which is what
+        // lets findFileById resolve it later. See
+        // Observed directly against DIA.
+        for (;;) {
+            CComPtr<IDiaSymbol> compiland;
+            ULONG fetched = 0;
+            if (FAILED(compilands->Next(1, &compiland, &fetched)) || fetched != 1) break;
+            CComPtr<IDiaEnumSourceFiles> files;
+            if (SUCCEEDED(session_->findFile(compiland, nullptr, nsNone, &files)) && files) {
+                for (;;) {
+                    CComPtr<IDiaSourceFile> file;
+                    ULONG ffetched = 0;
+                    if (FAILED(files->Next(1, &file, &ffetched)) || ffetched != 1) break;
+                    DWORD id = 0;
+                    file->get_uniqueId(&id);
+                }
+            }
+        }
+        file_index_warmed_ = true;
+        return true;
+    }
+
+    // Resolve a source file by id. Pays the one-time warm-up (see
+    // ensure_file_index_warm()) on first use, then is effectively O(1).
+    CComPtr<IDiaSourceFile> find_file_by_id(DWORD file_id) {
+        CComPtr<IDiaSourceFile> result;
+        if (!ensure_file_index_warm() || !session_) return result;
+        session_->findFileById(file_id, &result);
+        return result;
+    }
+
+    // Pays DIA's one-time SymTag enumeration warm-up for `tag` by walking the
+    // whole table once. This is a pure-DIA cost, general across tags: the
+    // first findChildren(tag)/Next() walk in a session pays a large fixed
+    // cost plus a decaying per-row ramp before it reaches the warm rate, so a
+    // small cold query can be orders of magnitude slower than the same query
+    // warm. Calls get_name() per row (not just Next()) to match
+    // extract_symbol()'s real per-row cost, so this warms what a real
+    // scan/LIKE-pushdown/rva-pushdown needs, not just a bare enumeration.
+    //
+    // Idempotent per tag (checked against warmed_symtags_), so callers never
+    // need to track it themselves.
+    //
+    // WARNING: tags vary enormously in per-symbol realization cost -- UDT/Enum
+    // symbols are far more expensive than Function symbols, so fully warming
+    // udts/enums on a huge PDB can itself take tens of seconds. That is why
+    // warming is an explicit per-table opt-in (--warm-tables <list>) resolved
+    // by the CLI, never applied to every table by default.
+    bool ensure_symtag_warm(enum SymTagEnum tag) {
+        if (warmed_symtags_.count(tag)) return true;
+        if (!global_) return false;
+
+        CComPtr<IDiaEnumSymbols> symbols;
+        if (FAILED(global_->findChildren(tag, nullptr, nsNone, &symbols)) || !symbols) {
+            return false;
+        }
+        for (;;) {
+            CComPtr<IDiaSymbol> symbol;
+            ULONG fetched = 0;
+            if (FAILED(symbols->Next(1, &symbol, &fetched)) || fetched != 1) break;
+            SafeBSTR name;
+            symbol->get_name(name.ptr());
+        }
+        warmed_symtags_.insert(tag);
+        return true;
+    }
+
 private:
     ComInit com_;  // Must be first - initializes COM
     CComPtr<IDiaDataSource> source_;
@@ -184,7 +313,30 @@ private:
     CComPtr<IDiaSymbol> global_;
     std::string path_;
     std::string last_error_;
+    bool file_index_warmed_ = false;
+    std::set<enum SymTagEnum> warmed_symtags_;
 };
+
+// Maps a `--warm-tables` CLI table name to the SymTagEnum `ensure_symtag_warm()`
+// needs. Deliberately covers only the tables whose real query path is a plain
+// global-scope findChildren(tag) walk -- the exact shape ensure_symtag_warm()
+// warms. Excludes: `line_numbers`/`source_files` (their own warm-up is
+// findFileById-based, see ensure_file_index_warm()/--warm-file-index, an
+// unrelated mechanism), `thunks`/`labels` (compiland-scoped children, not a
+// single global-scope enumeration -- warming them would need a different
+// walk), `udt_records`/`enum_records`/`udt_fields`/`udt_methods`/`enum_values`/
+// `base_classes`/`locals`/`parameters`/`sections`/`symbol_at`/
+// `runtime_settings` (not simple SymTag scans of the global scope at all).
+inline std::optional<enum SymTagEnum> symtag_for_warmable_table_name(const std::string& name) {
+    if (name == "functions") return SymTagFunction;
+    if (name == "publics") return SymTagPublicSymbol;
+    if (name == "data") return SymTagData;
+    if (name == "udts") return SymTagUDT;
+    if (name == "typedefs") return SymTagTypedef;
+    if (name == "enums") return SymTagEnum;
+    if (name == "compilands") return SymTagCompiland;
+    return std::nullopt;
+}
 
 // ============================================================================
 // Symbol info extraction helpers

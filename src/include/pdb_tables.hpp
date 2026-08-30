@@ -17,7 +17,9 @@
  *   publics       - Public symbols (exports, etc.)
  *   data          - Global/static data symbols
  *   udts          - User-defined types (structs, classes, unions)
+ *   udt_records   - One row per UDT with aggregate field/method counts
  *   enums         - Enumerations
+ *   enum_records  - One row per enum with aggregate value count
  *   typedefs      - Type aliases
  *   compilands    - Object files / compilation units
  *   source_files  - Source file paths
@@ -25,11 +27,14 @@
  *   sections      - PE sections from the SECTIONHEADERS debug stream (named)
  *   thunks        - Thunk symbols (import stubs, etc.)
  *   labels        - Code labels
- *   udt_members   - UDT member fields (struct/class members)
+ *   symbol_at     - TVF: innermost symbol containing a given address
+ *   udt_fields    - UDT data members (struct/class fields)
+ *   udt_methods   - UDT member functions
  *   enum_values   - Enum value constants
  *   base_classes  - Base class relationships
  *   locals        - Local variables (per function)
  *   parameters    - Function parameters (per function)
+ *   runtime_settings - Writable session settings (query_timeout_ms, ...)
  */
 
 #include <xsql/xsql.hpp>
@@ -368,10 +373,11 @@ inline CachedSymbol extract_symbol(IDiaSymbol* symbol, SymbolProjection proj = {
     return cs;
 }
 
-// Fill a udt_members row from one UDT child. `is_function` selects the member
-// FUNCTION reading (virtual/pure/isStatic, no meaningful offset) over the data
-// member reading (offset + type length, static via location). Shared by all three
-// udt_members generators so the scan and the two pushdown paths cannot drift.
+// Fill a udt_fields/udt_methods row from one UDT child. `is_function` selects
+// the member FUNCTION reading (virtual/pure/isStatic, no meaningful offset)
+// over the data member reading (offset + type length, static via location).
+// Shared by all three udt_fields/udt_methods generators (scan + two pushdown
+// paths) so they cannot drift.
 inline CachedMember extract_member(IDiaSymbol* member,
                                    bool is_function,
                                    DWORD parent_id,
@@ -624,7 +630,7 @@ inline bool is_placeholder_type_name(const std::string& name) {
 // One row per DISTINCT type name, streaming.
 //
 // DIA emits a type record per compiland that defines the type, so a raw
-// enumeration repeats names — on a large PDB, 1.75M records collapse to 1.23M
+// enumeration repeats names — on a large PDB, raw records collapse to substantially fewer
 // distinct names. That made the naive `SELECT ... FROM udts ORDER BY length DESC
 // LIMIT 10` return a half-duplicate top-N, and it made `WHERE name = X` (which
 // resolves DIA's single canonical record) disagree with a scan.
@@ -637,10 +643,42 @@ inline bool is_placeholder_type_name(const std::string& name) {
 //
 // Anonymous types are never deduplicated: each record is its own type and only
 // shares a placeholder label.
+
+// Translate a SQL LIKE pattern to DIA's glob syntax (`%` -> `*`, `_` -> `?`).
+// No ESCAPE-clause handling: this only needs to be a correct SUPERSET, since
+// libxsql's LIKE pushdown always leaves the constraint unconsumed (omit=0)
+// and SQLite re-applies the real pattern to every row this yields.
+// Three characters must be backslash-escaped: DIA's glob dialect
+// (nsCaseInRegularExpression) treats `\`, `[`, and `]` specially despite being
+// glob, not regex, syntax. Each silently matches ZERO rows rather than
+// erroring when left unescaped -- `D:\*` finds nothing where `D:\\*` finds
+// every D:-drive file, and an unescaped `[` (very common in C++ symbol names,
+// e.g. `Append<wchar_t const (&)[20]>`) does the same. Backslashes hit
+// source_files.filename on every Windows path; `[`/`]` hit symbol-name LIKE
+// via template and array signatures.
+inline std::string like_pattern_to_dia_glob(const std::string& like_pattern) {
+    std::string glob;
+    glob.reserve(like_pattern.size());
+    for (char c : like_pattern) {
+        if (c == '%') glob.push_back('*');
+        else if (c == '_') glob.push_back('?');
+        else if (c == '\\' || c == '[' || c == ']') { glob.push_back('\\'); glob.push_back(c); }
+        else glob.push_back(c);
+    }
+    return glob;
+}
+
 class DedupedSymbolGenerator : public xsql::Generator<CachedSymbol> {
     PdbSession& session_;
     enum SymTagEnum tag_;
     SymbolProjection proj_;
+    // Empty (default): source is the full raw walk (enum_symbols), matching a
+    // plain table scan. Non-empty: a raw SQL LIKE pattern (translated to DIA's
+    // glob syntax here, same as SymbolByGlobGenerator) -- used for
+    // `WHERE name LIKE 'prefix%'` pushdown on udts/enums, which stay
+    // dedup-by-name here for the same reason the un-pushed scan does (see
+    // like_pattern_'s call sites).
+    std::string like_pattern_;
     CComPtr<IDiaEnumSymbols> symbols_;
     std::unordered_set<std::string> seen_;
     CachedSymbol current_;
@@ -648,13 +686,16 @@ class DedupedSymbolGenerator : public xsql::Generator<CachedSymbol> {
     bool started_ = false;
 
 public:
-    DedupedSymbolGenerator(PdbSession& session, enum SymTagEnum tag, SymbolProjection proj = {})
-        : session_(session), tag_(tag), proj_(proj) {}
+    DedupedSymbolGenerator(PdbSession& session, enum SymTagEnum tag, SymbolProjection proj = {},
+                           std::string like_pattern = "")
+        : session_(session), tag_(tag), proj_(proj), like_pattern_(std::move(like_pattern)) {}
 
     bool next() override {
         if (!started_) {
             started_ = true;
-            symbols_ = session_.enum_symbols(tag_);
+            symbols_ = like_pattern_.empty()
+                ? session_.enum_symbols(tag_)
+                : session_.find_symbols_glob(like_pattern_to_dia_glob(like_pattern_), tag_);
         }
         if (!symbols_) return false;
 
@@ -682,6 +723,31 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
+// Cooperative cancellation for a long PARENT WALK, polled every 1024 iterations.
+//
+// Eight generators in this file share one shape: an `advance_<parent>()` that
+// pulls parents from a DIA enumerator until it finds one owning children of the
+// wanted tag. Because the query timeout is only observed BETWEEN
+// Generator::next() calls, a stretch of childless parents is consumed inside a
+// SINGLE next() that never yields -- so the deadline is not seen at all until
+// the walk happens to produce a row. The worst case is structural rather than
+// hypothetical: at the END of any such scan every remaining parent is consumed
+// in one uninterruptible call, and the sparse tags (`base_classes`, `labels`)
+// walk their entire parent population to produce comparatively few rows.
+//
+// Returns true if the query was interrupted, having already set the vtab error
+// -- an interrupted scan must report WHY rather than return silently truncated
+// rows. Callers bail immediately on true.
+//
+// The 1024-iteration stride matches the other tools in this family; a masked
+// compare at that rate costs nothing measurable.
+inline bool parent_walk_interrupted(unsigned& counter, const char* what) {
+    if ((++counter & 1023u) != 0) return false;
+    if (!xsql::vtab_interrupted()) return false;
+    xsql::set_vtab_error(std::string("query interrupted: timeout while walking ") + what);
+    return true;
+}
+
 // Streams symbols that are NOT children of the global scope.
 //
 // DIA nests some symbol kinds under a parent: thunks hang off their compiland and
@@ -700,12 +766,20 @@ class NestedSymbolGenerator : public xsql::Generator<CachedSymbol> {
     CachedSymbol current_;
     int64_t rowid_ = -1;
     bool started_ = false;
+    bool interrupted_ = false;  // advance_parent() bailed on cancellation, not exhaustion
+    unsigned scanned_ = 0;      // parent-walk counter for the cooperative cancellation poll
 
+    // Returns false when the parent enumeration is exhausted OR the query was
+    // cancelled; `interrupted_` distinguishes the two for the caller.
     bool advance_parent() {
         children_.Release();
         CComPtr<IDiaSymbol> parent;
         ULONG fetched = 0;
         while (SUCCEEDED(parents_->Next(1, &parent, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "parent symbols")) {
+                interrupted_ = true;
+                return false;
+            }
             if (SUCCEEDED(parent->findChildren(child_tag_, nullptr, nsNone, &children_)) && children_) {
                 return true;
             }
@@ -722,6 +796,9 @@ public:
         : session_(session), parent_tag_(parent_tag), child_tag_(child_tag), proj_(proj) {}
 
     bool next() override {
+        // Once cancelled, stay cancelled: without this a further next() would
+        // re-enter advance_parent() and resume the very walk the timeout stopped.
+        if (interrupted_) return false;
         if (!started_) {
             started_ = true;
             parents_ = session_.enum_symbols(parent_tag_);
@@ -783,22 +860,33 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
+// Optional glob_pattern (already translated from SQL LIKE via
+// like_pattern_to_dia_glob) narrows the walk via IDiaSession::findFile's own
+// glob search -- the same primitive find_symbols_glob() uses for symbol
+// names, since findFile takes the identical name/compareFlags shape as
+// findChildren. Empty pattern (the default) is the original unscoped walk.
 class SourceFileGenerator : public xsql::Generator<CachedSourceFile> {
     PdbSession& session_;
+    std::string glob_pattern_;
     CComPtr<IDiaEnumSourceFiles> source_files_;
     CachedSourceFile current_;
     int64_t rowid_ = -1;
     bool started_ = false;
 
 public:
-    explicit SourceFileGenerator(PdbSession& session) : session_(session) {}
+    explicit SourceFileGenerator(PdbSession& session, std::string glob_pattern = {})
+        : session_(session), glob_pattern_(std::move(glob_pattern)) {}
 
     bool next() override {
         if (!started_) {
             started_ = true;
-            IDiaSession* dia_session = session_.session();
-            if (!dia_session) return false;
-            if (FAILED(dia_session->findFile(nullptr, nullptr, nsNone, &source_files_))) return false;
+            if (glob_pattern_.empty()) {
+                IDiaSession* dia_session = session_.session();
+                if (!dia_session) return false;
+                if (FAILED(dia_session->findFile(nullptr, nullptr, nsNone, &source_files_))) return false;
+            } else {
+                source_files_ = session_.find_files_glob(glob_pattern_);
+            }
         }
         if (!source_files_) return false;
 
@@ -922,6 +1010,214 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
+// `WHERE file_id = X` pushdown for line_numbers. Resolves the file directly
+// via PdbSession::find_file_by_id() (DIA's findFileById, one-time index
+// warm-up per session -- see the doc comment there), then narrows to just
+// the compilands IDiaSourceFile::get_compilands() reports actually
+// reference that file (typically one, occasionally a handful for a shared
+// header) instead of LineNumberGenerator's walk of every compiland in the
+// PDB. Timed directly against DIA on a large PDB:
+// the unscoped full-walk equivalent of this query timed out past 300s;
+// this generator resolves a single file's line records in well under a
+// second once the session's file index is warm.
+class LineNumbersByFileIdGenerator : public xsql::Generator<CachedLineNumber> {
+    PdbSession& session_;
+    DWORD file_id_ = 0;
+    bool started_ = false;
+    CComPtr<IDiaSession> dia_session_;
+    CComPtr<IDiaSourceFile> file_;
+    CComPtr<IDiaEnumSymbols> compilands_;
+    CComPtr<IDiaSymbol> current_compiland_;
+    DWORD current_compiland_id_ = 0;
+    CComPtr<IDiaEnumLineNumbers> lines_;
+    CachedLineNumber current_;
+    int64_t rowid_ = -1;
+
+    bool advance_compiland() {
+        if (!compilands_) return false;
+        for (;;) {
+            current_compiland_.Release();
+            current_compiland_id_ = 0;
+            lines_.Release();
+
+            CComPtr<IDiaSymbol> compiland;
+            ULONG fetched = 0;
+            if (FAILED(compilands_->Next(1, &compiland, &fetched)) || fetched != 1) return false;
+
+            current_compiland_ = compiland;
+            current_compiland_->get_symIndexId(&current_compiland_id_);
+
+            if (SUCCEEDED(dia_session_->findLines(current_compiland_, file_, &lines_)) && lines_) {
+                return true;
+            }
+        }
+    }
+
+public:
+    LineNumbersByFileIdGenerator(PdbSession& session, DWORD file_id)
+        : session_(session)
+        , file_id_(file_id)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+
+            dia_session_ = session_.session();
+            if (!dia_session_) return false;
+
+            file_ = session_.find_file_by_id(file_id_);
+            if (!file_) return false;
+
+            if (FAILED(file_->get_compilands(&compilands_)) || !compilands_) return false;
+            if (!advance_compiland()) return false;
+        }
+
+        while (true) {
+            if (!lines_) {
+                if (!advance_compiland()) return false;
+                continue;
+            }
+
+            CComPtr<IDiaLineNumber> line;
+            ULONG fetched = 0;
+            if (FAILED(lines_->Next(1, &line, &fetched)) || fetched != 1) {
+                lines_.Release();
+                continue;
+            }
+
+            current_ = {};
+            line->get_sourceFileId(&current_.file_id);
+            line->get_lineNumber(&current_.line);
+            line->get_columnNumber(&current_.column);
+            line->get_relativeVirtualAddress(&current_.rva);
+            line->get_length(&current_.length);
+            current_.compiland_id = current_compiland_id_;
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedLineNumber& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// `WHERE rva >= X AND rva < Y` (and BETWEEN, which SQLite expands to a GE+LE
+// pair) pushdown for line_numbers -- the natural correlation a
+// `functions f JOIN line_numbers ln ON ln.rva >= f.rva AND ln.rva <
+// f.rva + f.length` query produces (SQLite feeds the outer row's f.rva/
+// f.rva+f.length in as if they were WHERE constants, once per outer row).
+// Backed by IDiaSession::findLinesByRVA(rva, length, &result), a direct,
+// narrow DIA API for exactly this shape -- essentially free
+// (~0.0002-0.0003ms average per call, no cold-call warm-up, no scaling
+// cliff at 10x sample size), directly against DIA:
+// a >10,000x speedup over the full-table-rescan-per-function fallback that
+// this class replaces (60+ seconds on a SMALL PDB for the same shape,
+// confirmed genuinely catastrophic and not a hang -- see
+// the line_numbers RVA-range-pushdown notes).
+class LineNumbersByRvaRangeGenerator : public xsql::Generator<CachedLineNumber> {
+    PdbSession& session_;
+    DWORD start_ = 0;
+    DWORD length_ = 0;
+    bool started_ = false;
+    CComPtr<IDiaSession> dia_session_;
+    CComPtr<IDiaEnumLineNumbers> lines_;
+    CachedLineNumber current_;
+    int64_t rowid_ = -1;
+
+public:
+    LineNumbersByRvaRangeGenerator(PdbSession& session, DWORD start, DWORD length)
+        : session_(session)
+        , start_(start)
+        , length_(length)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            dia_session_ = session_.session();
+            if (!dia_session_) return false;
+            if (FAILED(dia_session_->findLinesByRVA(start_, length_, &lines_)) || !lines_) return false;
+        }
+        if (!lines_) return false;
+
+        CComPtr<IDiaLineNumber> line;
+        ULONG fetched = 0;
+        if (FAILED(lines_->Next(1, &line, &fetched)) || fetched != 1) return false;
+
+        current_ = {};
+        line->get_sourceFileId(&current_.file_id);
+        line->get_lineNumber(&current_.line);
+        line->get_columnNumber(&current_.column);
+        line->get_relativeVirtualAddress(&current_.rva);
+        line->get_length(&current_.length);
+        CComPtr<IDiaSymbol> compiland;
+        if (SUCCEEDED(line->get_compiland(&compiland)) && compiland) {
+            compiland->get_symIndexId(&current_.compiland_id);
+        }
+        ++rowid_;
+        return true;
+    }
+
+    const CachedLineNumber& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// Parses GE/GT/LT/LE constraint args on line_numbers.rva into a normalized
+// half-open [start, end) range and builds LineNumbersByRvaRangeGenerator for
+// it. Falls back to the full unfiltered walk (LineNumberGenerator) when the
+// range isn't fully bounded (only one side given -- e.g. a bare
+// `WHERE rva >= X` with no upper bound, which DIA's findLinesByRVA can't
+// take a finite length for) or is empty/inverted. SQLite's own constraint
+// re-check (omit=false, same as the LIKE pushdown) still guarantees a
+// correct final result either way -- this only affects whether the fast
+// path applies, never correctness.
+inline std::unique_ptr<xsql::Generator<CachedLineNumber>> make_line_numbers_rva_range_generator(
+        PdbSession& session, const std::vector<xsql::GeneratorConstraintArg>& args) {
+    constexpr DWORD kMaxRva = 0xFFFFFFFFu;
+    auto as_rva = [kMaxRva](const xsql::FunctionArg& v) -> DWORD {
+        int64_t i = v.as_int64();
+        if (i < 0) return 0;
+        if (i > static_cast<int64_t>(kMaxRva)) return kMaxRva;
+        return static_cast<DWORD>(i);
+    };
+    auto saturating_next = [kMaxRva](DWORD rva) { return rva >= kMaxRva ? kMaxRva : rva + 1; };
+
+    DWORD start = 0;
+    DWORD end = kMaxRva;
+    bool has_start = false;
+    bool has_end = false;
+    for (const auto& arg : args) {
+        const DWORD rva = as_rva(arg.value);
+        switch (arg.op) {
+            case xsql::ConstraintOp::Ge:
+                start = has_start ? (std::max)(start, rva) : rva;
+                has_start = true;
+                break;
+            case xsql::ConstraintOp::Gt: {
+                const DWORD next = saturating_next(rva);
+                start = has_start ? (std::max)(start, next) : next;
+                has_start = true;
+                break;
+            }
+            case xsql::ConstraintOp::Le:
+                end = has_end ? (std::min)(end, saturating_next(rva)) : saturating_next(rva);
+                has_end = true;
+                break;
+            case xsql::ConstraintOp::Lt:
+                end = has_end ? (std::min)(end, rva) : rva;
+                has_end = true;
+                break;
+            default: break;
+        }
+    }
+
+    if (has_start && has_end && end > start) {
+        return std::make_unique<LineNumbersByRvaRangeGenerator>(session, start, end - start);
+    }
+    return std::make_unique<LineNumberGenerator>(session);
+}
+
 class SectionGenerator : public xsql::Generator<CachedSection> {
     PdbSession& session_;
     std::vector<CachedSection> sections_;
@@ -1028,6 +1324,8 @@ class MemberGenerator : public xsql::Generator<CachedMember> {
     int64_t rowid_ = -1;
     bool started_ = false;
 
+    unsigned scanned_ = 0;  // parent-walk cancellation poll counter
+
     bool advance_udt() {
         current_udt_id_ = 0;
         current_udt_name_.clear();
@@ -1036,6 +1334,7 @@ class MemberGenerator : public xsql::Generator<CachedMember> {
         CComPtr<IDiaSymbol> udt;
         ULONG fetched = 0;
         while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "UDTs for members")) return false;
             DWORD id = 0;
             udt->get_symIndexId(&id);
             std::string name = safe_symbol_name(udt);
@@ -1098,6 +1397,8 @@ class EnumValueGenerator : public xsql::Generator<CachedEnumValue> {
     int64_t rowid_ = -1;
     bool started_ = false;
 
+    unsigned scanned_ = 0;  // parent-walk cancellation poll counter
+
     bool advance_enum() {
         current_enum_.Release();
         current_enum_id_ = 0;
@@ -1107,6 +1408,7 @@ class EnumValueGenerator : public xsql::Generator<CachedEnumValue> {
         CComPtr<IDiaSymbol> en;
         ULONG fetched = 0;
         while (SUCCEEDED(enums_->Next(1, &en, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "enums for values")) return false;
             current_enum_ = en;
             current_enum_->get_symIndexId(&current_enum_id_);
             current_enum_name_ = safe_symbol_name(current_enum_);
@@ -1197,6 +1499,8 @@ class BaseClassGenerator : public xsql::Generator<CachedBaseClass> {
     int64_t rowid_ = -1;
     bool started_ = false;
 
+    unsigned scanned_ = 0;  // parent-walk cancellation poll counter
+
     bool advance_udt() {
         current_udt_.Release();
         current_udt_id_ = 0;
@@ -1206,6 +1510,7 @@ class BaseClassGenerator : public xsql::Generator<CachedBaseClass> {
         CComPtr<IDiaSymbol> udt;
         ULONG fetched = 0;
         while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "UDTs for base classes")) return false;
             current_udt_ = udt;
             current_udt_->get_symIndexId(&current_udt_id_);
             current_udt_name_ = safe_symbol_name(current_udt_);
@@ -1292,6 +1597,8 @@ class LocalOrParamGenerator : public xsql::Generator<CachedLocal> {
     int64_t next_ordinal_ = 0;
     bool started_ = false;
 
+    unsigned scanned_ = 0;  // parent-walk cancellation poll counter
+
     bool advance_func() {
         current_func_.Release();
         current_func_id_ = 0;
@@ -1302,6 +1609,7 @@ class LocalOrParamGenerator : public xsql::Generator<CachedLocal> {
         CComPtr<IDiaSymbol> func;
         ULONG fetched = 0;
         while (SUCCEEDED(functions_->Next(1, &func, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "functions for locals")) return false;
             current_func_ = func;
             current_func_->get_symIndexId(&current_func_id_);
             current_func_name_ = safe_symbol_name(current_func_);
@@ -1464,6 +1772,37 @@ inline void add_filter_eq_text(GeneratorTableDef<RowData>& def,
         });
 }
 
+// Registers a `WHERE <column> LIKE ?` pushdown. `factory` receives the raw SQL
+// LIKE pattern (e.g. "Curl_%") and SQLite's colUsed bitmask -- libxsql's
+// xBestIndex already restricts this to patterns with a usable literal prefix
+// (not a leading wildcard) and always leaves the constraint unconsumed
+// (omit=0), so SQLite re-checks the exact pattern regardless of what the
+// iterator returns; correctness does not depend on the iterator's own
+// filtering being exact. colUsed matters here specifically because a LIKE
+// match can yield hundreds/thousands of rows (unlike an exact `name =` match,
+// almost always 0-1) -- paying the undecorated-name demangle unconditionally
+// on every one of them, the way the exact-match generator does, would erase
+// most of the pushdown's win.
+template<typename RowData>
+inline void add_filter_like_text(GeneratorTableDef<RowData>& def,
+                                 const char* column_name,
+                                 std::function<std::unique_ptr<xsql::RowIterator>(const char*, uint64_t)> factory,
+                                 double cost = 10.0,
+                                 double est_rows = 1000.0) {
+    int col_idx = def.find_column(column_name ? column_name : "");
+    if (col_idx < 0) return;
+    int filter_id = static_cast<int>(def.filters.size()) + 1;
+    def.filters.emplace_back(
+        col_idx, filter_id, cost, est_rows,
+        std::function<std::unique_ptr<xsql::RowIterator>(xsql::FunctionArg)>{},
+        SQLITE_INDEX_CONSTRAINT_LIKE);
+    def.filters.back().create_with_col_used =
+        [factory = std::move(factory)](xsql::FunctionArg val, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
+            const char* text = val.as_c_str();
+            return factory(text ? text : "", col_used);
+        };
+}
+
 // Registers a GT/GE/LT/LE range pushdown on one column, ascending-ordered. Mirrors
 // xsql::GeneratorTableBuilder::constraint_filter()+order_by_consumed(), but as a
 // direct field mutation matching add_filter_eq's style, since functions_/publics_
@@ -1489,6 +1828,45 @@ inline void add_constraint_range_filter(
     cf.ordered_column = col_idx;
     cf.ordered_desc = false;
     cf.create = std::move(factory);
+    def.constraint_filters.push_back(std::move(cf));
+}
+
+// Projection-aware sibling of add_constraint_range_filter: the factory also
+// receives SQLite's colUsed bitmask (xsql::ConstraintFilterDef::
+// create_with_col_used), so a range-pushdown generator can skip an expensive
+// per-row field the query never selects -- the same idea
+// symbol_projection_from()/SymbolProjection already applies to the default
+// full-scan path (functions_/publics_'s .projection_generator()), extended
+// here to the range-filter path. Motivated by a real, cost: on
+// a large PDB, demangling 500 rows via SymbolRangeGenerator's unconditional
+// extract_symbol(symbol) (default SymbolProjection{}, undecorated=true) cost
+// ~20s even when the query only selected `rva` -- see
+// the 2026-08-24 measurement series' "later"
+// section (the declined tag-scan fast path) for the measurement that
+// surfaced this gap. Unlike that declined fix, skipping unselected work is
+// a pure win with no PDB-dependent tradeoff -- it never does MORE work than
+// the unprojected path, only ever equal or less.
+template<typename RowData>
+inline void add_constraint_range_filter_projection(
+        GeneratorTableDef<RowData>& def,
+        const char* column_name,
+        std::function<std::unique_ptr<xsql::Generator<RowData>>(
+            const std::vector<xsql::GeneratorConstraintArg>&, uint64_t)> factory,
+        double cost = 5.0,
+        double est_rows = 1000.0) {
+    int col_idx = def.find_column(column_name ? column_name : "");
+    if (col_idx < 0) return;
+    xsql::ConstraintFilterDef<RowData> cf;
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Gt, false, ""});
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Ge, false, ""});
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Lt, false, ""});
+    cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, xsql::ConstraintOp::Le, false, ""});
+    cf.filter_id = xsql::CONSTRAINT_FILTER_BASE + static_cast<int>(def.constraint_filters.size());
+    cf.estimated_cost = cost;
+    cf.estimated_rows = est_rows;
+    cf.ordered_column = col_idx;
+    cf.ordered_desc = false;
+    cf.create_with_col_used = std::move(factory);
     def.constraint_filters.push_back(std::move(cf));
 }
 
@@ -1532,6 +1910,207 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
+// Escapes a LITERAL string for use as a DIA glob pattern (nsfRegularExpression
+// -- glob syntax despite the name, `*`/`?` are the wildcards): backslash-escape
+// DIA's own metacharacters (`*`, `?`, `\`, `[`, `]`, matching
+// like_pattern_to_dia_glob's escaping for the last three) so the result
+// matches the input string
+// literally, with no wildcard interpretation, before a caller appends its own
+// trailing `*`.
+inline std::string dia_glob_escape_literal(const std::string& literal) {
+    std::string out;
+    out.reserve(literal.size());
+    for (char c : literal) {
+        if (c == '*' || c == '?' || c == '\\' || c == '[' || c == ']') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Robust exact-name lookup for udts/enums/typedefs, used instead of
+// SymbolByNameGenerator. DIA's name-search index carries hidden extra content
+// for compiler-generated closure/lambda type names: an exact search for the
+// very string get_name() returned finds NOTHING (every compare flag, including
+// regex), while the same string with a trailing `*` finds it. The symbol
+// exists and the name is byte-identical, so this is a DIA index quirk, not a
+// capture/compare bug on our side. Ordinary template instantiations containing
+// `<`/`>` match fine, so the angle brackets are not the cause.
+//
+// Fix: search with a trailing wildcard, then filter client-side to names that
+// are BYTE-IDENTICAL to the request. The wildcard search is a correctness
+// superset (it can only find more, never fewer), and the filter narrows it
+// back to exactly what `name = X` means -- without relying on SQLite's own
+// constraint omit/re-check behavior.
+class SymbolByExactNameRobustGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    enum SymTagEnum tag_;
+    std::string name_;
+    CComPtr<IDiaEnumSymbols> symbols_;
+    CachedSymbol current_;
+    int64_t rowid_ = -1;
+    bool started_ = false;
+    bool done_ = false;
+
+public:
+    SymbolByExactNameRobustGenerator(PdbSession& session, enum SymTagEnum tag, std::string name)
+        : session_(session)
+        , tag_(tag)
+        , name_(std::move(name))
+    {}
+
+    bool next() override {
+        if (done_) return false;
+        if (!started_) {
+            started_ = true;
+            // Placeholder type names (is_placeholder_type_name: "", "<unnamed-tag>",
+            // "<anonymous-tag>") have no correct match here, by this table's
+            // own established design (see that function's doc comment):
+            // dozens of unrelated anonymous types share one placeholder
+            // text, so DIA's name index deliberately can't resolve them by
+            // exact match at all -- reporting them as SQL NULL instead of
+            // the placeholder text is what keeps the scan and pushdown
+            // paths in agreement. A bare "" name would turn into a "*"
+            // pattern (matches everything); a literal "<unnamed-tag>"
+            // pattern would newly start matching (DIA's index carries this
+            // text for real, just like the lambda case above) -- either
+            // way, filtering by `candidate.name == name_` would pick an
+            // arbitrary ONE of several unrelated anonymous types, which is
+            // wrong regardless of which one. Refuse before ever calling DIA.
+            if (is_placeholder_type_name(name_)) { done_ = true; return false; }
+
+            // EXACT-FIRST, glob only on a miss. The wildcard search is why this
+            // generator exists, but on udts/enums DIA's glob/regex name search
+            // costs tens of seconds while an exact search is ~free -- so an
+            // ordinary `WHERE name = 'SomeType'` was paying the glob price
+            // purely to cover the lambda-name case.
+            //
+            // Correctness is unchanged: the fallback still runs whenever exact
+            // search comes up empty, which is exactly the lambda/closure quirk
+            // documented above. This only skips the expensive path when the
+            // cheap one already answered.
+            symbols_ = session_.find_symbols(name_, tag_);
+            if (symbols_) {
+                LONG exact_count = 0;
+                if (FAILED(symbols_->get_Count(&exact_count)) || exact_count == 0) {
+                    symbols_.Release();
+                }
+            }
+            if (!symbols_) {
+                symbols_ = session_.find_symbols_glob(dia_glob_escape_literal(name_) + "*", tag_);
+            }
+        }
+        if (!symbols_) { done_ = true; return false; }
+
+        for (;;) {
+            CComPtr<IDiaSymbol> symbol;
+            ULONG fetched = 0;
+            if (FAILED(symbols_->Next(1, &symbol, &fetched)) || fetched != 1) { done_ = true; return false; }
+
+            CachedSymbol candidate = extract_symbol(symbol);
+            if (candidate.name != name_) continue;  // wildcard superset -- keep only the exact match
+
+            // `name` denotes one canonical entry, same as every other exact
+            // lookup on this table (matching DedupedSymbolGenerator's
+            // "one row per distinct name" contract, and the SCAN-based
+            // reference this pushdown is checked against) -- multiple raw
+            // DIA records can legitimately share one name (multiple
+            // compilands referencing the same type, or two
+            // identically-numbered lambdas with different hidden internal
+            // disambiguators -- both indistinguishable via `name` alone), so
+            // stop at the first exact match rather than yielding every one.
+            done_ = true;
+            current_ = std::move(candidate);
+            ++rowid_;
+            return true;
+        }
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// Like SymbolByNameGenerator, but for `WHERE name LIKE ...` pushdown: DIA's
+// own glob search (nsCaseInRegularExpression) over the name index, several
+// times faster than a full client-side walk-and-compare. Always a correct
+// superset -- the LIKE constraint stays unconsumed, so SQLite re-checks the
+// exact pattern on every row.
+class SymbolByGlobGenerator : public xsql::Generator<CachedSymbol> {
+    PdbSession& session_;
+    enum SymTagEnum tag_;
+    std::string like_pattern_;
+    SymbolProjection proj_;
+    CComPtr<IDiaEnumSymbols> symbols_;
+    CachedSymbol current_;
+    int64_t rowid_ = -1;
+    bool started_ = false;
+
+public:
+    SymbolByGlobGenerator(PdbSession& session, enum SymTagEnum tag, std::string like_pattern,
+                          SymbolProjection proj = {})
+        : session_(session)
+        , tag_(tag)
+        , like_pattern_(std::move(like_pattern))
+        , proj_(proj)
+    {}
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            symbols_ = session_.find_symbols_glob(like_pattern_to_dia_glob(like_pattern_), tag_);
+        }
+        if (!symbols_) return false;
+
+        CComPtr<IDiaSymbol> symbol;
+        ULONG fetched = 0;
+        if (FAILED(symbols_->Next(1, &symbol, &fetched)) || fetched != 1) {
+            return false;
+        }
+
+        current_ = extract_symbol(symbol, proj_);
+        ++rowid_;
+        return true;
+    }
+
+    const CachedSymbol& current() const override { return current_; }
+    int64_t rowid() const override { return rowid_; }
+};
+
+// Fallback for a symbolById() failure. DIA builds its id->symbol index lazily,
+// per-id, as a findChildren walk touches each symbol -- so symbolById() fails
+// with E_INVALIDARG for any id not yet touched IN THIS SESSION, even when the
+// id genuinely exists (touching id=1 does NOT unlock id=655090). A failure
+// therefore does NOT mean "no such id", and treating it that way returns ZERO
+// ROWS for a symbol that is really there. Every symbolById() call site must
+// fall back to this.
+//
+// This walks `tag` linearly matching symIndexId, so it is always correct
+// regardless of warm-up state, but it is O(N) in the id's enumeration position
+// -- a high id costs seconds, and a NON-EXISTENT id is the worst case (nothing
+// short-circuits, so it walks the whole tag before returning nullptr). Prefer
+// reaching a parent by NAME over a literal id. The walk warms every id it
+// passes, so later lookups at or below that point are free, and a warm session
+// never reaches this path at all.
+//
+// CANCELLATION: polled every 1024 iterations. On interrupt this MUST set the
+// vtab error before bailing -- "cancelled" and "not found" both return nullptr
+// otherwise, and the caller reads nullptr as "no such id" and emits ZERO ROWS,
+// reintroducing via the timeout path exactly the silent-wrong-result this
+// fallback exists to prevent.
+inline CComPtr<IDiaSymbol> find_symbol_by_id_fallback(PdbSession& session, DWORD id, enum SymTagEnum tag) {
+    CComPtr<IDiaEnumSymbols> symbols = session.enum_symbols(tag);
+    if (!symbols) return nullptr;
+    unsigned scanned = 0;
+    for (;;) {
+        if (parent_walk_interrupted(scanned, "symbols to resolve an id")) return nullptr;
+        CComPtr<IDiaSymbol> symbol;
+        ULONG fetched = 0;
+        if (FAILED(symbols->Next(1, &symbol, &fetched)) || fetched != 1) return nullptr;
+        DWORD got_id = 0;
+        symbol->get_symIndexId(&got_id);
+        if (got_id == id) return symbol;
+    }
+}
+
 class SymbolByIdGenerator : public xsql::Generator<CachedSymbol> {
     PdbSession& session_;
     DWORD id_ = 0;
@@ -1561,7 +2140,10 @@ public:
 
         CComPtr<IDiaSymbol> symbol;
         if (FAILED(dia_session->symbolById(id_, &symbol)) || !symbol) {
-            return false;
+            // symbolById() failure is not conclusive -- see
+            // find_symbol_by_id_fallback's doc comment.
+            symbol = find_symbol_by_id_fallback(session_, id_, tag_);
+            if (!symbol) return false;
         }
 
         DWORD got_tag = 0;
@@ -1583,20 +2165,51 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
+// The `data` table's scope: file-static, global, and constant data only -- excludes
+// member/local data symbols that also carry SymTagData but belong to udt_fields/
+// locals instead. The unscoped generator gets this implicitly for free (it only
+// walks the global scope's children, and member/local data aren't global-scope
+// children), but a scope-independent lookup (symbolById, findSymbolByRVA) can reach
+// ANY SymTagData symbol anywhere in the PDB, so every id/rva-scoped data_ generator
+// must re-check this explicitly to stay within the table's documented row set.
+inline bool is_data_table_kind(IDiaSymbol* symbol) {
+    if (!symbol) return false;
+    DWORD kind = 0;
+    if (FAILED(symbol->get_dataKind(&kind))) return false;
+    return kind == DataIsFileStatic || kind == DataIsGlobal || kind == DataIsConstant;
+}
+
 // Emits the single symbol at an exact RVA via DIA's native findSymbolByRVA (a direct
 // address-index lookup — no full walk, no cache). findSymbolByRVA is containment-based,
 // so we confirm the exact start to honor `WHERE rva = X` (SQLite omits the recheck).
+//
+// KNOWN LIMITATION, not assumed: when MULTIPLE symbols genuinely share the
+// exact same start rva (observed on data: CFG guard-check symbols like
+// `__guard_xfg_check_icall_fptr` legitimately appear as several distinct ids at one
+// address), findSymbolByRVA returns exactly one of them, not the full tied set -- a
+// manual scan filtered to that rva can return more rows than this pushdown does.
+// Deliberately not "fixed" by switching to IDiaEnumSymbolsByAddr's seek-and-walk (the
+// only DIA API that could enumerate ties): that primitive has an erratic, landing-
+// dependent cost (0.05-28.6s, directly against DIA) vs.
+// findSymbolByRVA's low-single-digit-ms typical cost (direct DIA
+// measurement) -- paying that for every rva= lookup to cover a rare tie
+// would regress
+// the common case to fix an edge case whose duplicate rows are typically near-identical
+// aliases anyway. If exact completeness under ties is ever required, add an opt-in
+// TVF/pragma rather than changing this filter's default cost profile.
 class SymbolByRvaGenerator : public xsql::Generator<CachedSymbol> {
     PdbSession& session_;
     DWORD rva_ = 0;
     enum SymTagEnum tag_;
+    std::function<bool(IDiaSymbol*)> accept_;
     CachedSymbol current_;
     bool emitted_ = false;
     int64_t rowid_ = -1;
 
 public:
-    SymbolByRvaGenerator(PdbSession& session, DWORD rva, enum SymTagEnum tag)
-        : session_(session), rva_(rva), tag_(tag) {}
+    SymbolByRvaGenerator(PdbSession& session, DWORD rva, enum SymTagEnum tag,
+                         std::function<bool(IDiaSymbol*)> accept = nullptr)
+        : session_(session), rva_(rva), tag_(tag), accept_(std::move(accept)) {}
 
     bool next() override {
         if (emitted_) return false;
@@ -1608,6 +2221,10 @@ public:
         DWORD got_rva = 0;
         if (FAILED(symbol->get_relativeVirtualAddress(&got_rva)) || got_rva != rva_) {
             return false;  // containment hit that does not start exactly at rva_
+        }
+
+        if (accept_ && !accept_(symbol)) {
+            return false;
         }
 
         current_ = extract_symbol(symbol);
@@ -1622,7 +2239,7 @@ public:
 // Emits the single innermost symbol of ANY kind CONTAINING an address, via DIA's
 // findSymbolByRVA(SymTagNull) — the engine of the `symbol_at(addr)` table-valued
 // function. Unlike SymbolByRvaGenerator (exact-start `WHERE rva = X`), this KEEPS a
-// containment hit. Measured DIA behavior (kb symbol-at-lab/FINDINGS.md) is
+// containment hit. DIA's behavior here is
 // nearest-at-or-below, so we confirm the address truly falls within
 // [start, start+length) before emitting; an address in a gap yields no row.
 class SymbolAtRvaGenerator : public xsql::Generator<CachedSymbol> {
@@ -1686,16 +2303,28 @@ class SymbolRangeGenerator : public xsql::Generator<CachedSymbol> {
     DWORD start_ = 0;              // inclusive lower bound
     DWORD end_ = 0xFFFFFFFFu;      // exclusive upper bound (only checked if has_end_)
     bool has_end_ = false;
+    std::function<bool(IDiaSymbol*)> accept_;
+    SymbolProjection proj_;        // default {} (undecorated=true) -- see 4-arg ctor
     CComPtr<IDiaEnumSymbolsByAddr> by_addr_;
     CComPtr<IDiaSymbol> pending_;  // the symbol returned directly by the symbolByRVA seek
     CachedSymbol current_;
     int64_t rowid_ = -1;
     bool started_ = false;
     bool done_ = false;
+    unsigned scanned_ = 0;  // skip-loop counter for the cooperative cancellation poll
 
 public:
-    SymbolRangeGenerator(PdbSession& session, enum SymTagEnum tag, DWORD start, DWORD end, bool has_end)
-        : session_(session), tag_(tag), start_(start), end_(end), has_end_(has_end) {}
+    SymbolRangeGenerator(PdbSession& session, enum SymTagEnum tag, DWORD start, DWORD end, bool has_end,
+                        std::function<bool(IDiaSymbol*)> accept = nullptr)
+        : session_(session), tag_(tag), start_(start), end_(end), has_end_(has_end), accept_(std::move(accept)) {}
+
+    // Projection-aware overload: skips the demangle (SymbolProjection::undecorated)
+    // when the query never selects it -- see add_constraint_range_filter_projection's
+    // doc comment for the observed cost this avoids.
+    SymbolRangeGenerator(PdbSession& session, enum SymTagEnum tag, DWORD start, DWORD end, bool has_end,
+                        SymbolProjection proj, std::function<bool(IDiaSymbol*)> accept = nullptr)
+        : session_(session), tag_(tag), start_(start), end_(end), has_end_(has_end),
+          accept_(std::move(accept)), proj_(proj) {}
 
     bool next() override {
         if (done_) return false;
@@ -1706,6 +2335,17 @@ public:
             by_addr_->symbolByRVA(start_, &pending_);
         }
         for (;;) {
+            // Cooperative cancellation INSIDE the skip loop. The three `continue`
+            // paths below (below start_, wrong tag, rejected by accept_) advance
+            // without yielding, so on a sparse tag this single next() call can walk
+            // a large stretch of the address space. The query timeout is only
+            // observed BETWEEN next() calls, so without this poll the deadline is
+            // not seen until the loop happens to produce a row. Same 1024-iteration
+            // idiom the other tools in this family use.
+            if (parent_walk_interrupted(scanned_, "symbols by address")) {
+                done_ = true;
+                return false;
+            }
             CComPtr<IDiaSymbol> symbol;
             if (pending_) {
                 symbol = pending_;
@@ -1722,8 +2362,9 @@ public:
             if (rva < start_) continue;  // symbolByRVA seeks at-or-after start_, but be defensive
             if (has_end_ && rva >= end_) { done_ = true; return false; }  // past the upper bound: stop
             if (static_cast<enum SymTagEnum>(tag) != tag_) continue;      // wrong kind, keep walking
+            if (accept_ && !accept_(symbol)) continue;                   // right tag, wrong kind subset
 
-            current_ = extract_symbol(symbol);
+            current_ = extract_symbol(symbol, proj_);
             ++rowid_;
             return true;
         }
@@ -1736,10 +2377,14 @@ public:
 // Parses GT/GE/LT/LE constraint args on one rva column into a normalized half-open
 // [start, end) range and builds the SymbolRangeGenerator for it. Saturates on the
 // DWORD range boundary (0xFFFFFFFF) when converting an exclusive bound to inclusive
-// (or vice versa).
+// (or vice versa). `proj` defaults to {} (compute everything) for the plain
+// (non-projection-aware) callers; make_symbol_range_generator_projection below
+// passes the real colUsed-derived projection.
 inline std::unique_ptr<xsql::Generator<CachedSymbol>> make_symbol_range_generator(
         PdbSession& session, enum SymTagEnum tag,
-        const std::vector<xsql::GeneratorConstraintArg>& args) {
+        const std::vector<xsql::GeneratorConstraintArg>& args,
+        std::function<bool(IDiaSymbol*)> accept = nullptr,
+        SymbolProjection proj = {}) {
     constexpr DWORD kMaxRva = 0xFFFFFFFFu;
     auto as_rva = [kMaxRva](const xsql::FunctionArg& v) -> DWORD {
         int64_t i = v.as_int64();
@@ -1768,7 +2413,7 @@ inline std::unique_ptr<xsql::Generator<CachedSymbol>> make_symbol_range_generato
             default: break;
         }
     }
-    return std::make_unique<SymbolRangeGenerator>(session, tag, start, end, has_end);
+    return std::make_unique<SymbolRangeGenerator>(session, tag, start, end, has_end, proj, std::move(accept));
 }
 
 class CompilandByNameGenerator : public xsql::Generator<CachedCompiland> {
@@ -1829,7 +2474,10 @@ public:
 
         CComPtr<IDiaSymbol> symbol;
         if (FAILED(dia_session->symbolById(id_, &symbol)) || !symbol) {
-            return false;
+            // symbolById() failure is not conclusive -- see
+            // find_symbol_by_id_fallback's doc comment.
+            symbol = find_symbol_by_id_fallback(session_, id_, SymTagCompiland);
+            if (!symbol) return false;
         }
 
         DWORD tag = 0;
@@ -1907,7 +2555,12 @@ public:
             if (!dia_session) return false;
 
             CComPtr<IDiaSymbol> udt;
-            if (FAILED(dia_session->symbolById(udt_id_, &udt)) || !udt) return false;
+            if (FAILED(dia_session->symbolById(udt_id_, &udt)) || !udt) {
+                // symbolById() failure is not conclusive -- see
+                // find_symbol_by_id_fallback's doc comment.
+                udt = find_symbol_by_id_fallback(session_, udt_id_, SymTagUDT);
+                if (!udt) return false;
+            }
 
             DWORD tag = 0;
             udt->get_symTag(&tag);
@@ -1952,6 +2605,8 @@ class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
     int64_t rowid_ = -1;
     bool started_ = false;
 
+    unsigned scanned_ = 0;  // parent-walk cancellation poll counter
+
     bool advance_udt() {
         parent_id_ = 0;
         parent_name_.clear();
@@ -1960,6 +2615,7 @@ class UdtMembersByNameGenerator : public xsql::Generator<CachedMember> {
         CComPtr<IDiaSymbol> udt;
         ULONG fetched = 0;
         while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "UDTs by name")) return false;
             DWORD id = 0;
             udt->get_symIndexId(&id);
             std::string name = safe_symbol_name(udt);
@@ -2052,7 +2708,12 @@ public:
             if (!dia_session) return false;
 
             CComPtr<IDiaSymbol> en;
-            if (FAILED(dia_session->symbolById(enum_id_, &en)) || !en) return false;
+            if (FAILED(dia_session->symbolById(enum_id_, &en)) || !en) {
+                // symbolById() failure is not conclusive -- see
+                // find_symbol_by_id_fallback's doc comment.
+                en = find_symbol_by_id_fallback(session_, enum_id_, SymTagEnum);
+                if (!en) return false;
+            }
 
             DWORD tag = 0;
             en->get_symTag(&tag);
@@ -2104,6 +2765,8 @@ class EnumValuesByNameGenerator : public xsql::Generator<CachedEnumValue> {
     int64_t rowid_ = -1;
     bool started_ = false;
 
+    unsigned scanned_ = 0;  // parent-walk cancellation poll counter
+
     bool advance_enum() {
         current_enum_.Release();
         current_enum_id_ = 0;
@@ -2113,6 +2776,7 @@ class EnumValuesByNameGenerator : public xsql::Generator<CachedEnumValue> {
         CComPtr<IDiaSymbol> en;
         ULONG fetched = 0;
         while (SUCCEEDED(enums_->Next(1, &en, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "enums by name")) return false;
             current_enum_ = en;
             current_enum_->get_symIndexId(&current_enum_id_);
             current_enum_name_ = safe_symbol_name(current_enum_);
@@ -2244,6 +2908,8 @@ class BaseClassesByDerivedNameGenerator : public xsql::Generator<CachedBaseClass
     int64_t rowid_ = -1;
     bool started_ = false;
 
+    unsigned scanned_ = 0;  // parent-walk cancellation poll counter
+
     bool advance_udt() {
         current_udt_.Release();
         derived_id_ = 0;
@@ -2253,6 +2919,7 @@ class BaseClassesByDerivedNameGenerator : public xsql::Generator<CachedBaseClass
         CComPtr<IDiaSymbol> udt;
         ULONG fetched = 0;
         while (SUCCEEDED(udts_->Next(1, &udt, &fetched)) && fetched == 1) {
+            if (parent_walk_interrupted(scanned_, "UDTs by derived name")) return false;
             current_udt_ = udt;
             current_udt_->get_symIndexId(&derived_id_);
             resolved_name_ = safe_symbol_name(current_udt_);
@@ -2326,7 +2993,12 @@ public:
             if (!dia_session) return false;
 
             CComPtr<IDiaSymbol> udt;
-            if (FAILED(dia_session->symbolById(derived_id_, &udt)) || !udt) return false;
+            if (FAILED(dia_session->symbolById(derived_id_, &udt)) || !udt) {
+                // symbolById() failure is not conclusive -- see
+                // find_symbol_by_id_fallback's doc comment.
+                udt = find_symbol_by_id_fallback(session_, derived_id_, SymTagUDT);
+                if (!udt) return false;
+            }
 
             DWORD tag = 0;
             udt->get_symTag(&tag);
@@ -2379,7 +3051,12 @@ public:
             if (!dia_session) return false;
 
             CComPtr<IDiaSymbol> func;
-            if (FAILED(dia_session->symbolById(func_id_, &func)) || !func) return false;
+            if (FAILED(dia_session->symbolById(func_id_, &func)) || !func) {
+                // symbolById() failure is not conclusive -- see
+                // find_symbol_by_id_fallback's doc comment.
+                func = find_symbol_by_id_fallback(session_, func_id_, SymTagFunction);
+                if (!func) return false;
+            }
 
             DWORD tag = 0;
             func->get_symTag(&tag);
@@ -2483,7 +3160,12 @@ public:
             dia_session_ = session_.session();
             if (!dia_session_) return false;
 
-            if (FAILED(dia_session_->symbolById(compiland_id_, &compiland_)) || !compiland_) return false;
+            if (FAILED(dia_session_->symbolById(compiland_id_, &compiland_)) || !compiland_) {
+                // symbolById() failure is not conclusive -- see
+                // find_symbol_by_id_fallback's doc comment.
+                compiland_ = find_symbol_by_id_fallback(session_, compiland_id_, SymTagCompiland);
+                if (!compiland_) return false;
+            }
 
             DWORD tag = 0;
             compiland_->get_symTag(&tag);
@@ -2613,9 +3295,9 @@ inline std::optional<std::string> type_name_or_null(const CachedSymbol& r) {
 }
 
 // One row per distinct type. NO .row_count() shortcut: DIA's get_Count(SymTagUDT)
-// is *slower* than enumerating on a large PDB -- measured on a 3.14 GB PDB, the
-// shortcut blew past the 60 s default timeout and errored, while a full walk plus
-// dedup returned 1,229,669 rows in 59 s. It also could not answer the deduped
+// is *slower* than enumerating on a large PDB -- the
+// shortcut blew past the default timeout and errored, while a full walk plus
+// dedup completed just inside it. It also could not answer the deduped
 // count anyway.
 inline GeneratorTableDef<CachedSymbol> define_udts_table(PdbSession& session) {
     return generator_table<CachedSymbol>("udts")
@@ -2641,7 +3323,10 @@ inline GeneratorTableDef<CachedSymbol> define_udt_records_table(PdbSession& sess
         .build();
 }
 
-// Enums table -- same dedup model as udts.
+// Enums table -- same dedup model as udts, and (observed, not assumed) the
+// same NO .row_count() shortcut
+// reasoning: get_Count(SymTagEnum) is just as expensive as get_Count(SymTagUDT)
+// and equally uncached, so it is not a cheaper alternative to a raw walk.
 inline GeneratorTableDef<CachedSymbol> define_enums_table(PdbSession& session) {
     return generator_table<CachedSymbol>("enums")
         .estimate_rows([]() { return kSymbolRowEstimate; })
@@ -2740,7 +3425,7 @@ inline GeneratorTableDef<CachedSection> define_sections_table(PdbSession& sessio
         .column_int("length", [](const CachedSection& r) { return static_cast<int>(r.length); })
         // characteristics is a DWORD; IMAGE_SCN_MEM_WRITE (0x80000000) sets the high
         // bit, so a signed int would surface a negative value. Widen to int64 and mask
-        // to 32 bits (matches idasql/ghidra 32-bit-flag exposure).
+        // to 32 bits, so the value reads as the unsigned flag word it is.
         .column_int64("characteristics", [](const CachedSection& r) { return static_cast<int64_t>(r.characteristics) & 0xFFFFFFFFLL; })
         .column_int("readable", [](const CachedSection& r) { return r.read ? 1 : 0; })
         .column_int("writable", [](const CachedSection& r) { return r.write ? 1 : 0; })
@@ -2991,6 +3676,17 @@ public:
                                    std::make_unique<SymbolByNameGenerator>(session_, SymTagFunction, name ? name : ""));
                            },
                            5.0, 10.0);
+        // WHERE name LIKE 'prefix%': DIA glob pushdown, 3-8x faster than a full
+        // walk-and-compare (direct DIA measurement). Superset only --
+        // libxsql leaves the constraint unconsumed and re-checks exactly.
+        add_filter_like_text(functions_, "name",
+                             [functions_def, this](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
+                                 return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                     functions_def,
+                                     std::make_unique<SymbolByGlobGenerator>(session_, SymTagFunction, pattern ? pattern : "",
+                                                                             symbol_projection_from(col_used, 2)));
+                             },
+                             8.0, 1000.0);
         // WHERE rva = X: direct DIA address-index lookup (findSymbolByRVA), not a full
         // walk. Cache-free; cost=1 so the planner strongly prefers it over a scan.
         add_filter_eq(functions_, "rva",
@@ -3007,10 +3703,14 @@ public:
         // GE+LE pair): one symbolByRVA seek + a linear walk stopping at the upper
         // bound. A reconnect/resume aid and a genuine analytical range query -- NOT a
         // per-page pagination mechanism (see SymbolRangeGenerator's doc comment).
-        add_constraint_range_filter<CachedSymbol>(
+        // _projection: skips the demangle when `undecorated` isn't selected -- see
+        // add_constraint_range_filter_projection's doc comment for the observed cost
+        // (~20s for 500 rows on a large PDB) this avoids.
+        add_constraint_range_filter_projection<CachedSymbol>(
             functions_, "rva",
-            [this](const std::vector<xsql::GeneratorConstraintArg>& args) {
-                return make_symbol_range_generator(session_, SymTagFunction, args);
+            [this](const std::vector<xsql::GeneratorConstraintArg>& args, uint64_t col_used) {
+                return make_symbol_range_generator(session_, SymTagFunction, args, nullptr,
+                                                    symbol_projection_from(col_used, 2));
             },
             5.0, 1000.0);
 
@@ -3032,6 +3732,14 @@ public:
                                    std::make_unique<SymbolByNameGenerator>(session_, SymTagPublicSymbol, name ? name : ""));
                            },
                            5.0, 10.0);
+        add_filter_like_text(publics_, "name",
+                             [publics_def, this](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
+                                 return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                     publics_def,
+                                     std::make_unique<SymbolByGlobGenerator>(session_, SymTagPublicSymbol, pattern ? pattern : "",
+                                                                             symbol_projection_from(col_used, 2)));
+                             },
+                             8.0, 1000.0);
         add_filter_eq(publics_, "rva",
                       [publics_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
                           if (rva < 0 || rva > 0xFFFFFFFFLL) {
@@ -3042,10 +3750,12 @@ public:
                               std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagPublicSymbol));
                       },
                       1.0, 1.0);
-        add_constraint_range_filter<CachedSymbol>(
+        // _projection: see the matching functions_.rva registration above.
+        add_constraint_range_filter_projection<CachedSymbol>(
             publics_, "rva",
-            [this](const std::vector<xsql::GeneratorConstraintArg>& args) {
-                return make_symbol_range_generator(session_, SymTagPublicSymbol, args);
+            [this](const std::vector<xsql::GeneratorConstraintArg>& args, uint64_t col_used) {
+                return make_symbol_range_generator(session_, SymTagPublicSymbol, args, nullptr,
+                                                    symbol_projection_from(col_used, 2));
             },
             5.0, 1000.0);
 
@@ -3055,15 +3765,38 @@ public:
                           if (id <= 0 || id > 0xFFFFFFFFLL) {
                               return std::make_unique<GeneratorRowIterator<CachedSymbol>>(data_def, nullptr);
                           }
-                          auto accept = [](IDiaSymbol* symbol) -> bool {
-                              if (!symbol) return false;
-                              DWORD kind = 0;
-                              if (FAILED(symbol->get_dataKind(&kind))) return false;
-                              return kind == DataIsFileStatic || kind == DataIsGlobal || kind == DataIsConstant;
-                          };
                           return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
                               data_def,
-                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), SymTagData, accept));
+                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), SymTagData,
+                                                                    is_data_table_kind));
+                      },
+                      1.0, 1.0);
+        // rva= on data mirrors functions_/publics_ (same findSymbolByRVA
+        // primitive, one seek), narrowed by is_data_table_kind so a scope-
+        // independent lookup can't surface a member/local data symbol that
+        // isn't in this table's scan. Deliberately NOT a range filter
+        // (rva > / >= / < / <=), unlike functions_/publics_: SymTagData is a
+        // small minority of the by-address symbol stream (functions dominate
+        // it), so a one-sided range -- the common `rva > 0 LIMIT n`
+        // exploratory shape -- seeks once and then WALKS past every non-data
+        // symbol in between. On a large PDB that does not finish in a
+        // reasonable time even for a small LIMIT, while the plain unscoped
+        // SymTagData enumerator answers the same question in about a second.
+        // A genuinely bounded two-sided
+        // range would still be fine, but xBestIndex has no way to tell a
+        // user's `rva > 0` apart from `rva > <near a known value>` at
+        // planning time, so the filter can't be offered at all without this
+        // trap; the eq filter has no such risk (a single seek is O(one
+        // lookup) regardless of how sparse the tag is).
+        add_filter_eq(data_, "rva",
+                      [data_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
+                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(data_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              data_def,
+                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagData,
+                                                                     is_data_table_kind));
                       },
                       1.0, 1.0);
         add_filter_eq_text(data_, "name",
@@ -3073,6 +3806,14 @@ public:
                                    std::make_unique<SymbolByNameGenerator>(session_, SymTagData, name ? name : ""));
                            },
                            5.0, 10.0);
+        add_filter_like_text(data_, "name",
+                             [data_def, this](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
+                                 return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                     data_def,
+                                     std::make_unique<SymbolByGlobGenerator>(session_, SymTagData, pattern ? pattern : "",
+                                                                             symbol_projection_from(col_used, -1)));
+                             },
+                             8.0, 1000.0);
 
         // symbolById is scope-independent, so this is valid for globally-scoped and
         // nested symbol kinds alike.
@@ -3102,13 +3843,57 @@ public:
                                   std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), tag));
                           },
                           1.0, 1.0);
+            // SymbolByExactNameRobustGenerator, not SymbolByNameGenerator: see
+            // its doc comment -- DIA's exact-name search (nsCaseSensitive)
+            // silently returns zero rows for certain compiler-generated
+            // closure/lambda type names (100% reproduction on this class of
+            // name), which udts/enums/typedefs are exactly the surfaces most
+            // likely to carry. functions/publics/data keep
+            // SymbolByNameGenerator -- not verified to share this issue, and
+            // changing them without evidence would be a guess, not a fix.
             add_filter_eq_text(def, "name",
                                [def_ptr, this, tag](const char* name) -> std::unique_ptr<xsql::RowIterator> {
                                    return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
                                        def_ptr,
-                                       std::make_unique<SymbolByNameGenerator>(session_, tag, name ? name : ""));
+                                       std::make_unique<SymbolByExactNameRobustGenerator>(session_, tag, name ? name : ""));
                                },
                                5.0, 10.0);
+        };
+
+        // `WHERE name LIKE 'prefix%'`, plain (non-deduplicated) source: safe for
+        // typedefs, which -- like functions/publics/data -- is a straight
+        // one-row-per-symbol table with no canonical-record collapsing.
+        auto add_like_filter_plain = [this](GeneratorTableDef<CachedSymbol>& def, enum SymTagEnum tag) {
+            auto* def_ptr = &def;
+            add_filter_like_text(def, "name",
+                                 [def_ptr, this, tag](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
+                                     return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                         def_ptr,
+                                         std::make_unique<SymbolByGlobGenerator>(session_, tag, pattern ? pattern : "",
+                                                                                 symbol_projection_from(col_used, -1)));
+                                 },
+                                 8.0, 1000.0);
+        };
+
+        // `WHERE name LIKE 'prefix%'`, deduplicated source: required for
+        // udts/enums. Unlike an EXACT name match (DIA's name index already
+        // resolves to the one canonical record, so SymbolByNameGenerator needs
+        // no dedup wrapper), a glob match returns every per-compiland record for
+        // every matched name -- the same duplication a plain full-scan-without-
+        // dedup would have, just scoped to the matched subset. Routes through
+        // DedupedSymbolGenerator's glob-source mode instead of SymbolByGlobGenerator
+        // to keep udts/enums' promised "one row per distinct type" semantics.
+        auto add_like_filter_deduped = [this](GeneratorTableDef<CachedSymbol>& def, enum SymTagEnum tag) {
+            auto* def_ptr = &def;
+            add_filter_like_text(def, "name",
+                                 [def_ptr, this, tag](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
+                                     return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                         def_ptr,
+                                         std::make_unique<DedupedSymbolGenerator>(session_, tag,
+                                                                                  symbol_projection_from(col_used, -1),
+                                                                                  pattern ? pattern : ""));
+                                 },
+                                 8.0, 1000.0);
         };
 
         // `udts`/`enums` are deduplicated, and DIA's name index resolves the one
@@ -3118,17 +3903,45 @@ public:
         // scan returns every per-compiland record, i.e. a pushdown contradicting
         // its own table.
         add_name_and_id_filters(udts_, SymTagUDT);
+        add_like_filter_deduped(udts_, SymTagUDT);
         add_name_and_id_filters(enums_, SymTagEnum);
+        add_like_filter_deduped(enums_, SymTagEnum);
         add_id_filter_only(udt_records_, SymTagUDT);
         add_id_filter_only(enum_records_, SymTagEnum);
         add_name_and_id_filters(typedefs_, SymTagTypedef);
-        // Thunks/labels get the id filter only. The by-name generator resolves
-        // through the GLOBAL scope, which holds neither kind (they are compiland
-        // and function children), so a name filter would return 0 rows while a
-        // plain scan returns the symbol -- a pushdown that contradicts the table.
-        // symbolById is scope-independent, so the id filter stays valid.
+        add_like_filter_plain(typedefs_, SymTagTypedef);
+        // Thunks/labels get id and rva filters, but NOT name. The by-name
+        // generator resolves through the GLOBAL scope, which holds neither kind
+        // (they are compiland and function children), so a name filter would
+        // return 0 rows while a plain scan returns the symbol -- a pushdown that
+        // contradicts the table. symbolById and findSymbolByRVA are both
+        // scope-independent (unlike findChildren-based name lookup), so id and
+        // rva stay valid -- verified live, not assumed: a real thunk/label rva
+        // resolves to the same id/name a full scan reports.
         add_id_filter_only(thunks_, SymTagThunk);
         add_id_filter_only(labels_, SymTagLabel);
+        auto* thunks_def = &thunks_;
+        add_filter_eq(thunks_, "rva",
+                      [thunks_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
+                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(thunks_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              thunks_def,
+                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagThunk));
+                      },
+                      1.0, 1.0);
+        auto* labels_def = &labels_;
+        add_filter_eq(labels_, "rva",
+                      [labels_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
+                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(labels_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              labels_def,
+                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagLabel));
+                      },
+                      1.0, 1.0);
 
         auto* compilands_def = &compilands_;
         add_filter_eq(compilands_, "id",
@@ -3160,6 +3973,23 @@ public:
                               std::make_unique<SourceFileByIdGenerator>(session_, static_cast<DWORD>(id)));
                       },
                       1.0, 1.0);
+        // WHERE filename LIKE 'prefix%' pushes down to DIA's own glob search
+        // over source files (IDiaSession::findFile takes the same
+        // name/compareFlags shape as symbol findChildren -- mirrors the
+        // functions/publics/data name LIKE pushdown). Unlike udts/enums'
+        // LIKE (correctness-only, no speed win -- DIA's UDT/Enum symbol
+        // realization dominates regardless of filtering), source files are
+        // NOT realized the expensive way: the baseline unscoped scan itself
+        // is already cheap (~1s for a large file table on a large PDB), so this is
+        // a genuine but modest win, not a doesn't-complete-to-fast jump.
+        add_filter_like_text(source_files_, "filename",
+                             [source_files_def, this](const char* pattern, uint64_t) -> std::unique_ptr<xsql::RowIterator> {
+                                 return std::make_unique<GeneratorRowIterator<CachedSourceFile>>(
+                                     source_files_def,
+                                     std::make_unique<SourceFileGenerator>(
+                                         session_, like_pattern_to_dia_glob(pattern ? pattern : "")));
+                             },
+                             8.0, 1000.0);
 
         // udt_fields / udt_methods share the scoping filters; only the child tag
         // they enumerate differs.
@@ -3268,6 +4098,28 @@ public:
                               std::make_unique<LineNumbersByCompilandIdGenerator>(session_, static_cast<DWORD>(id)));
                       },
                       50.0, 1000.0);
+
+        add_filter_eq(line_numbers_, "file_id",
+                      [line_numbers_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedLineNumber>>(line_numbers_def, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedLineNumber>>(
+                              line_numbers_def,
+                              std::make_unique<LineNumbersByFileIdGenerator>(session_, static_cast<DWORD>(id)));
+                      },
+                      5.0, 100.0);
+
+        // Bounded WHERE rva > / >= / < / <= X (and BETWEEN) -- the shape
+        // `functions f JOIN line_numbers ln ON ln.rva >= f.rva AND ln.rva <
+        // f.rva + f.length` needs. See make_line_numbers_rva_range_generator's
+        // doc comment, and observed directly against DIA.
+        add_constraint_range_filter<CachedLineNumber>(
+            line_numbers_, "rva",
+            [this](const std::vector<xsql::GeneratorConstraintArg>& args) {
+                return make_line_numbers_rva_range_generator(session_, args);
+            },
+            5.0, 50.0);
     }
 
     void register_all(xsql::Database& db) {

@@ -7,7 +7,7 @@
 #
 
 cmake_minimum_required(VERSION 3.20)
-project(pdbsql VERSION 0.0.6 LANGUAGES C CXX)
+project(pdbsql VERSION 0.0.7 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,6 +30,46 @@ option(PDBSQL_WITH_MCP "Build with MCP server support (fastmcpp)" ON)
 if(PDBSQL_WITH_HTTP)
     message(STATUS "pdbsql: Building with HTTP server support")
     set(XSQL_WITH_THINCLIENT ON CACHE BOOL "" FORCE)
+endif()
+
+# --- The embedded agent reference -------------------------------------------
+#
+# prompts/pdbsql_agent.md is the SOLE teaching surface for this tool: pdbsql
+# ships no skills package, so this file is what
+# both server modes hand to an AI agent -- HTTP serves it from GET /help, and
+# MCP serves it from the pdbsql_help tool. It is compiled into the binary so
+# the two can never drift from the file, and nothing generated is tracked.
+#
+# It is deliberately NOT gated on PDBSQL_WITH_HTTP: an MCP-only build
+# (-DPDBSQL_WITH_MCP=ON -DPDBSQL_WITH_HTTP=OFF) needs it just as much, and
+# gating it on HTTP alone made that configuration fail to compile.
+#
+# Exposed as an INTERFACE library carrying the include dir, plus a custom
+# target that drives generation. Consumers link the library AND add a
+# dependency on the target -- the custom command's OUTPUT is scoped to THIS
+# directory, so a consumer in another directory (the CLI, and the private
+# test suite's mcp_server.cpp target) cannot rely on the OUTPUT alone.
+if(PDBSQL_WITH_HTTP OR PDBSQL_WITH_MCP)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+    set(PDBSQL_AGENT_PROMPT_MD  ${CMAKE_CURRENT_SOURCE_DIR}/prompts/pdbsql_agent.md)
+    set(PDBSQL_AGENT_PROMPT_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    set(PDBSQL_AGENT_PROMPT_HPP ${PDBSQL_AGENT_PROMPT_DIR}/pdbsql_agent_prompt.hpp)
+
+    add_custom_command(
+        OUTPUT ${PDBSQL_AGENT_PROMPT_HPP}
+        COMMAND Python3::Interpreter
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_prompt.py
+                ${PDBSQL_AGENT_PROMPT_MD} ${PDBSQL_AGENT_PROMPT_HPP}
+        DEPENDS ${PDBSQL_AGENT_PROMPT_MD}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_prompt.py
+        COMMENT "pdbsql: embedding pdbsql_agent.md into pdbsql_agent_prompt.hpp"
+        VERBATIM
+    )
+    add_custom_target(pdbsql_agent_prompt_gen DEPENDS ${PDBSQL_AGENT_PROMPT_HPP})
+
+    add_library(pdbsql_agent_prompt INTERFACE)
+    target_include_directories(pdbsql_agent_prompt INTERFACE ${PDBSQL_AGENT_PROMPT_DIR})
 endif()
 
 # Output directories (only set if building standalone)
@@ -109,6 +149,7 @@ if(PDBSQL_WITH_MCP)
     if(NOT TARGET fastmcpp_core)
         set(FASTMCPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_BUILD_CLI OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_ENABLE_POST_STREAMING OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_ENABLE_SAMPLING_HTTP_HANDLERS OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_FETCH_CURL OFF CACHE BOOL "" FORCE)

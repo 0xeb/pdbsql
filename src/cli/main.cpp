@@ -50,6 +50,23 @@ static bool parse_port(const std::string &s, int &port) {
     catch (...) { return false; }
 }
 
+// Splits a comma-separated `--warm-tables` value into individual table
+// names, trimming surrounding whitespace on each so `a, b,c` parses the
+// same as `a,b,c`. Empty entries (a stray leading/trailing/doubled comma)
+// are dropped rather than surfaced as an invalid table name.
+static std::vector<std::string> split_warm_table_names(const std::string& csv) {
+    std::vector<std::string> out;
+    std::stringstream ss(csv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        size_t start = item.find_first_not_of(" \t");
+        size_t end = item.find_last_not_of(" \t");
+        if (start == std::string::npos) continue;
+        out.push_back(item.substr(start, end - start + 1));
+    }
+    return out;
+}
+
 //=============================================================================
 // Local helpers
 //=============================================================================
@@ -100,13 +117,35 @@ static bool execute_query(xsql::Database& db, const char* sql,
     }
 
     // Surface partial/timeout/warnings on stderr — never pollutes the data.
+    //
+    // A timed-out statement makes the CLI exit NON-ZERO. It used to return
+    // `ok` (i.e. "the query itself did not error"), which reported a
+    // truncated result as success: observed on a large PDB,
+    // `--dump functions --format tsv -o out.tsv` at the default 60 s timeout
+    // wrote a fraction of a percent of the table and exited 0.
+    // The stderr warning was there, but a script doing
+    // `pdbsql ... -o out.tsv 2>/dev/null && process out.tsv` (or any CI step
+    // that checks only the exit status) silently consumed a 99.85%-incomplete
+    // export as if it were complete. Truncated-but-reported-successful is the
+    // worst possible outcome for a bulk export, so it now fails loudly; the
+    // partial rows are still written and the warning still printed, so a
+    // caller that WANTS a best-effort prefix can still use the file, it just
+    // has to acknowledge the non-zero status deliberately.
+    bool timed_out_any = false;
     for (const auto& stmt : script.results) {
         for (const auto& w : stmt.warnings) {
             fprintf(stderr, "Warning: %s\n", w.c_str());
         }
         if (stmt.timed_out) {
             fprintf(stderr, "Warning: query timed out; results are partial\n");
+            timed_out_any = true;
         }
+    }
+    if (timed_out_any) {
+        fprintf(stderr,
+                "Error: result is INCOMPLETE (query timed out). Re-run with "
+                "--query-timeout <sec> (0 = no limit) for a complete result.\n");
+        return false;
     }
     return ok;
 }
@@ -134,14 +173,17 @@ static void print_usage(const char* prog) {
     printf("  %s <pdb_file> --http [port]          Start HTTP REST server (default: 8080)\n", prog);
     printf("  %s <pdb_file> --bind <addr>          Bind address for server (default: 127.0.0.1)\n", prog);
     printf("  %s --query-timeout <sec>             Seed runtime_settings.query_timeout_ms for the servers (0 = no limit; default 60)\n", prog);
+    printf("  %s <pdb_file> --http --warm-file-index  Pay the line_numbers file_id warm-up (10-18s on a large PDB) at startup, not on the first query (also works with --mcp)\n", prog);
+    printf("  %s <pdb_file> --http --warm-tables <list>  Pay the listed tables' one-time DIA enumeration warm-up at startup (comma-separated: functions,publics,data,udts,typedefs,enums,compilands -- also works with --mcp)\n", prog);
 #endif
 #ifdef PDBSQL_HAS_MCP
     printf("  %s <pdb_file> --mcp [port]           Start MCP server (default: random 9000-9999)\n", prog);
 #endif
     printf("\nTables:\n");
-    printf("  functions, publics, data, udts, enums, typedefs, thunks, labels\n");
-    printf("  compilands, source_files, line_numbers, sections\n");
-    printf("  udt_members, enum_values, base_classes, locals, parameters\n");
+    printf("  functions, publics, data, udts, udt_records, enums, enum_records, typedefs\n");
+    printf("  thunks, labels, symbol_at(addr), compilands, source_files, line_numbers, sections\n");
+    printf("  udt_fields, udt_methods, enum_values, base_classes, locals, parameters\n");
+    printf("  runtime_settings (writable)\n");
     printf("\nExamples:\n");
     printf("  %s test.pdb \"SELECT name, rva FROM functions LIMIT 10\"\n", prog);
     printf("  %s test.pdb \"SELECT * FROM udts WHERE name LIKE '%%Counter%%'\"\n", prog);
@@ -221,6 +263,8 @@ int main(int argc, char* argv[]) {
     bool interactive = false;
     bool http_mode = false;
     int http_port = 8080;
+    bool warm_file_index = false;
+    std::vector<std::string> warm_tables;
     bool mcp_mode = false;
     int mcp_port = 0;  // 0 = random port in 9000-9999
     int query_timeout_sec = -1;  // -1 = flag not given (keep runtime_settings default)
@@ -257,6 +301,19 @@ int main(int argc, char* argv[]) {
                 std::string port_str = argv[++i];
                 if (!parse_port(port_str, http_port)) {
                     fprintf(stderr, "Invalid HTTP port: %s\n", port_str.c_str());
+                    return 1;
+                }
+            }
+        } else if (strcmp(argv[i], "--warm-file-index") == 0) {
+            warm_file_index = true;
+        } else if (strcmp(argv[i], "--warm-tables") == 0 && i + 1 < argc) {
+            warm_tables = split_warm_table_names(argv[++i]);
+            for (const auto& name : warm_tables) {
+                if (!pdbsql::symtag_for_warmable_table_name(name)) {
+                    fprintf(stderr,
+                            "Error: --warm-tables: unknown table '%s' -- valid tables are "
+                            "functions, publics, data, udts, typedefs, enums, compilands\n",
+                            name.c_str());
                     return 1;
                 }
             }
@@ -323,7 +380,7 @@ int main(int argc, char* argv[]) {
 
 #ifdef PDBSQL_HAS_HTTP
     if (http_mode) {
-        return run_http_mode(pdb_path, http_port, bind_addr, auth_token);
+        return run_http_mode(pdb_path, http_port, bind_addr, auth_token, warm_file_index, warm_tables);
     }
 #else
     if (http_mode) {
@@ -334,7 +391,7 @@ int main(int argc, char* argv[]) {
 
 #ifdef PDBSQL_HAS_MCP
     if (mcp_mode) {
-        return run_mcp_mode(pdb_path, mcp_port, bind_addr);
+        return run_mcp_mode(pdb_path, mcp_port, bind_addr, warm_file_index, warm_tables);
     }
 #else
     if (mcp_mode) {
@@ -363,7 +420,15 @@ int main(int argc, char* argv[]) {
     registry.register_all(db);
 
     // --dump <table> is sugar for "SELECT * FROM <table>" (pair with --format/-o for a
-    // machine-readable bulk export; use --query-timeout 0 for a full unbounded dump).
+    // machine-readable bulk export). --query-timeout 0 lifts the safety net for a full
+    // unbounded dump -- fine for a symbol table's cheap columns, but SELECT * pulls
+    // `undecorated` too, whose demangle cost on a large table's real symbol names can run
+    // to hours, not seconds (at the default timeout it returned a tiny fraction of
+    // every function). Even the column-limited fast path still permanently commits
+    // several GB of RAM to the process for a large table -- that cost comes from the
+    // underlying engine realizing each symbol as it walks, not from the response size, and
+    // is never released. See prompts/pdbsql_agent.md's "Aggregates"/bulk-export section for
+    // the full guidance.
     if (!dump_table.empty()) {
         bool valid = true;
         for (char c : dump_table) {

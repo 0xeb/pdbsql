@@ -11,84 +11,65 @@
 #include "query_json.hpp"
 #include "pdb_session.hpp"
 #include "pdb_tables.hpp"
+#include "../common/http_server.hpp"
 
 #include <xsql/database.hpp>
-#include <xsql/thinclient/server.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <csignal>
-#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
-static xsql::thinclient::server* g_http_server = nullptr;
+static pdbsql::PdbsqlHTTPServer* g_http_server = nullptr;
 
 static void http_signal_handler(int) {
     if (g_http_server) g_http_server->stop();
 }
 
-static const char* PDBSQL_HELP_TEXT = R"(PDBSQL HTTP REST API
-====================
+// The shared http_query_server parses X-XSQL-Timeout into opts.timeout_ms
+// when the client sends it, but has no notion of pdbsql's own server-side
+// default (--query-timeout, seeded into runtime_settings). opts.timeout_ms
+// stays 0 (its ScriptOptions default) when the header is absent, so apply
+// the runtime_settings default exactly then -- matching the pre-consolidation
+// behavior where this server always had SOME bound unless a client explicitly
+// asked for none.
+static xsql::ScriptOptions with_default_timeout(const xsql::ScriptOptions& opts) {
+    if (opts.timeout_ms != 0) return opts;
+    xsql::ScriptOptions effective = opts;
+    effective.timeout_ms = pdbsql::runtime_settings().query_timeout_ms();
+    return effective;
+}
 
-SQL interface for Windows PDB debug symbols via HTTP.
+// A timed-out statement comes back from the shared core with the bare error
+// "Query timed out" (libxsql's query_script.hpp) -- accurate, but it leaves an
+// operator with no idea that the query is answerable at all, or how. Several
+// ordinary questions on a large PDB genuinely exceed the 60 s family-default
+// timeout, so out of the box the operator sees only "Query timed out" for a
+// question that WOULD succeed with a larger bound.
+//
+// Attach the remedy as a WARNING rather than rewriting the error: the error
+// string is the shared core's contract (every family tool returns the same
+// text, and clients may match on it), while `warnings` is the established
+// channel for advisory context and is already surfaced by the JSON envelope,
+// the CLI, and the streaming paths. This keeps the fix entirely inside pdbsql
+// -- no libxsql change, so no 6-consumer re-verification -- while still telling
+// the operator what to do next.
+static void annotate_timeout_guidance(xsql::ScriptResult& script) {
+    for (auto& stmt : script.results) {
+        if (!stmt.timed_out) continue;
+        stmt.warnings.push_back(
+            "pdbsql: this query exceeded the query timeout. Retry with a larger "
+            "bound -- send an 'X-XSQL-Timeout: <ms>' header (e.g. 180000), or "
+            "start the server with --query-timeout <sec> (0 = no limit). Whole-table "
+            "questions over udts/enums on a large PDB commonly need 60-120s; see "
+            "the Performance section of the agent prompt for the fast alternatives.");
+    }
+}
 
-Endpoints:
-  GET  /         - Welcome message
-  GET  /help     - This documentation (for LLM discovery)
-  POST /query    - Execute SQL (body = raw SQL, response = JSON)
-  POST /cancel   - Cancel the in-flight query (it returns its partial rows)
-  GET  /status   - Server health
-  POST /shutdown - Stop server
-
-POST /query headers:
-  X-XSQL-Stream: 1       - stream the JSON envelope row-by-row (chunked; use curl -N)
-  X-XSQL-Stream: ndjson  - stream one JSON object per row per line (NDJSON)
-  X-XSQL-Timeout: <ms>   - bound this request (0 = no limit)
-
-Tables:
-  functions       - Functions with RVA, size, section info
-  symbol_at(addr) - TVF: innermost symbol containing an address (addr -> symbol)
-  publics         - Public symbols
-  data            - Data symbols (global/static variables)
-  udts            - User-defined types (classes, structs, unions)
-  enums           - Enumerations
-  typedefs        - Type definitions
-  thunks          - Thunk symbols
-  labels          - Labels
-  compilands      - Compilation units
-  source_files    - Source file paths
-  line_numbers    - Line number mappings
-  sections        - PE sections
-  udt_members     - UDT member fields
-  enum_values     - Enumeration values
-  base_classes    - Class inheritance
-  locals          - Local variables
-  parameters      - Function parameters
-
-Example Queries:
-  SELECT name, rva, length FROM functions ORDER BY length DESC LIMIT 10;
-  SELECT name, kind FROM symbol_at(0x14002A1F0);   -- symbol at an address
-  SELECT name FROM udts LIMIT 10;
-  SELECT * FROM sections;
-
-Response Format (multi-statement envelope):
-  {"results": [{"success": true, "columns": [...], "rows": [[...]], "row_count": N},
-               {"success": false, "error": "message"}, ...],
-   "statement_count": M, "row_count_total": T, "first_error_index": null}
-  results[] holds one object per statement; first_error_index is the index of the first
-  failed statement (null if all succeeded).
-
-Authentication (if enabled):
-  Header: Authorization: Bearer <token>
-  Or:     X-XSQL-Token: <token>
-
-Example:
-  curl http://localhost:8080/help
-  curl -X POST http://localhost:8080/query -d "SELECT name FROM functions LIMIT 5"
-)";
-
-int run_http_mode(const std::string& pdb_path, int port, const std::string& bind_addr, const std::string& auth_token) {
+int run_http_mode(const std::string& pdb_path, int port, const std::string& bind_addr,
+                  const std::string& auth_token, bool warm_file_index,
+                  const std::vector<std::string>& warm_tables) {
     // Open PDB
     pdbsql::PdbSession session;
     if (!session.open(pdb_path)) {
@@ -98,191 +79,49 @@ int run_http_mode(const std::string& pdb_path, int port, const std::string& bind
 
     printf("PDBSQL HTTP Server - Loaded: %s\n", pdb_path.c_str());
 
+    // Opt-in: pay line_numbers' WHERE file_id=X one-time DIA index warm-up
+    // 
+    // here at startup instead of on whichever client's query happens to touch
+    // file_id first. X-XSQL-Timeout cannot cut this short
+    // either way  --
+    // this flag only moves WHERE the cost lands, from an unpredictable first
+    // request to a predictable startup delay, for operators who'd rather have
+    // that tradeoff than a slow/timed-out first file_id query in production.
+    if (warm_file_index) {
+        printf("Warming line_numbers file_id index...\n");
+        fflush(stdout);
+        const auto warm_t0 = std::chrono::steady_clock::now();
+        session.ensure_file_index_warm();
+        const double warm_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count();
+        printf("File index warm in %.2fs\n", warm_sec);
+    }
+
+    // Opt-in: pay the listed tables' one-time DIA enumeration warm-up (seconds
+    // per table on a large PDB) here at startup instead of on whichever
+    // client's query happens to touch that table first. Same tradeoff as
+    // --warm-file-index: moves an unpredictable slow-first-query cost to a
+    // predictable startup delay. main.cpp
+    // already validated every name in warm_tables against
+    // symtag_for_warmable_table_name(), so this loop only sees known-good
+    // table names.
+    for (const auto& table_name : warm_tables) {
+        auto tag = pdbsql::symtag_for_warmable_table_name(table_name);
+        printf("Warming %s table...\n", table_name.c_str());
+        fflush(stdout);
+        const auto warm_t0 = std::chrono::steady_clock::now();
+        session.ensure_symtag_warm(*tag);
+        const double warm_sec =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count();
+        printf("%s table warm in %.2fs\n", table_name.c_str(), warm_sec);
+    }
+
     // Create database and register tables
     xsql::Database db;
     pdbsql::TableRegistry registry(session);
     registry.register_all(db);
 
-    xsql::thinclient::server_config cfg;
-    cfg.port = port;
-    cfg.bind_address = bind_addr.empty() ? "127.0.0.1" : bind_addr;
-    if (!auth_token.empty()) cfg.auth_token = auth_token;
-    if (!bind_addr.empty() && bind_addr != "127.0.0.1" && bind_addr != "localhost") {
-        cfg.allow_insecure_no_auth = auth_token.empty();
-        fprintf(stderr, "WARNING: Binding to non-loopback address %s\n", bind_addr.c_str());
-        if (auth_token.empty()) {
-            fprintf(stderr, "WARNING: No authentication token set. Server is accessible without authentication.\n");
-            fprintf(stderr, "         Consider using --token <secret> for remote access.\n");
-        }
-    }
-
-    std::mutex query_mutex;
-    // Server-wide cancel flag. POST /cancel sets it (on its own httplib worker
-    // thread); the in-flight /query — which holds query_mutex on a different worker —
-    // observes it via ScriptOptions::should_cancel and bails with partial rows. It is
-    // reset to false under query_mutex at the start of each query, so a stale cancel
-    // never bleeds into the next one. This is the root fix for a runaway query
-    // poisoning the serial server (the X-XSQL-Timeout bound is the softer mitigation).
-    std::atomic<bool> cancel_requested{false};
-
-    cfg.setup_routes = [&db, &pdb_path, &auth_token, &query_mutex, &cancel_requested, port](httplib::Server& svr) {
-        svr.Get("/", [port](const httplib::Request&, httplib::Response& res) {
-            std::string welcome = "PDBSQL HTTP Server\n\nEndpoints:\n"
-                "  GET  /help     - API documentation\n"
-                "  POST /query    - Execute SQL query\n"
-                "  POST /cancel   - Cancel in-flight query\n"
-                "  GET  /status   - Health check\n"
-                "  POST /shutdown - Stop server\n\n"
-                "Example: curl -X POST http://localhost:" + std::to_string(port) + "/query -d \"SELECT name FROM functions LIMIT 5\"\n";
-            res.set_content(welcome, "text/plain");
-        });
-
-        svr.Get("/help", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(PDBSQL_HELP_TEXT, "text/plain");
-        });
-
-        svr.Post("/query", [&db, &auth_token, &query_mutex, &cancel_requested](const httplib::Request& req, httplib::Response& res) {
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
-                else if (req.has_header("Authorization")) {
-                    auto auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-            if (req.body.empty()) {
-                res.status = 400;
-                res.set_content("{\"success\":false,\"error\":\"Empty query\"}", "application/json");
-                return;
-            }
-
-            // Per-request timeout from the shared runtime_settings (read fresh, so
-            // an UPDATE runtime_settings / PRAGMA takes effect immediately). Both
-            // paths reuse the same libxsql machinery via ScriptOptions::timeout_ms.
-            xsql::ScriptOptions sopts;
-            sopts.timeout_ms = pdbsql::runtime_settings().query_timeout_ms();
-
-            // Optional per-request override: `X-XSQL-Timeout: <ms>` (0 = no limit).
-            // Lets a client bound an individual query even when the server default is
-            // unlimited (--query-timeout 0), without a global UPDATE runtime_settings.
-            if (req.has_header("X-XSQL-Timeout")) {
-                try {
-                    const long ms = std::stol(req.get_header_value("X-XSQL-Timeout"));
-                    if (ms >= 0) sopts.timeout_ms = static_cast<int>(ms);
-                } catch (...) { /* invalid header: keep the runtime_settings default */ }
-            }
-
-            // Wire the server-wide cancel flag so POST /cancel aborts this query even
-            // under --query-timeout 0 (the deadline above still applies when set). The
-            // flag is reset under query_mutex just before the query runs (below).
-            sopts.should_cancel = [&cancel_requested]() { return cancel_requested.load(); };
-
-            // Opt-in streaming: `X-XSQL-Stream: 1` streams the result envelope
-            // row-by-row via a chunked response, so a multi-million-row dump never
-            // materializes a whole JSON string in RAM. `X-XSQL-Stream: ndjson` instead
-            // streams one JSON object per row per line (no envelope). The chunked
-            // provider runs on the worker thread AFTER this handler returns, so the
-            // query_mutex must be taken INSIDE the provider — a handler-scoped lock
-            // would already be released when streaming starts.
-            const std::string stream_hdr = req.has_header("X-XSQL-Stream")
-                                               ? req.get_header_value("X-XSQL-Stream") : std::string();
-            const bool stream_ndjson = (stream_hdr == "ndjson");
-            const bool stream = stream_ndjson || stream_hdr == "1" || stream_hdr == "true";
-            if (stream) {
-                std::string sql = req.body;
-                res.set_chunked_content_provider(
-                    stream_ndjson ? "application/x-ndjson" : "application/json",
-                    [&db, &query_mutex, &cancel_requested, sql, sopts, stream_ndjson](size_t, httplib::DataSink& sink) {
-                        std::lock_guard<std::mutex> lock(query_mutex);
-                        cancel_requested.store(false);  // fresh per in-flight query, under the lock
-                        // Propagate the sink's disconnect signal (write() == false) so a
-                        // client that drops mid-stream aborts the query promptly.
-                        auto out = [&sink](const char* d, std::size_t n) { return sink.write(d, n); };
-                        if (pdbsql::script_has_runtime_pragma(sql)) {
-                            // The generic streaming executor cannot intercept
-                            // product PRAGMAs. Preserve their semantics by
-                            // emitting the product-adapted result as one chunk;
-                            // ordinary data-only scripts retain O(one-row)
-                            // streaming below.
-                            const auto script = pdbsql::run_pdbsql_script(db, sql, sopts);
-                            const std::string body = stream_ndjson
-                                ? xsql::script_result_to_jsonl(script)
-                                : xsql::script_result_to_json(script, sopts.include_sql);
-                            (void)out(body.data(), body.size());
-                        } else if (stream_ndjson) {
-                            xsql::stream_database_script_ndjson(db, sql, sopts, out);
-                        } else {
-                            xsql::stream_database_script_json(db, sql, sopts, out);
-                        }
-                        sink.done();
-                        return true;
-                    });
-                return;
-            }
-
-            std::lock_guard<std::mutex> lock(query_mutex);
-            cancel_requested.store(false);  // fresh per in-flight query, under the lock
-            res.set_content(query_result_to_json(db, req.body, sopts), "application/json");
-        });
-
-        svr.Get("/status", [&pdb_path](const httplib::Request&, httplib::Response& res) {
-            // Unauthenticated liveness probe (exempt from --token, like /help): it
-            // exposes no PDB data and NEVER touches DIA (no COUNT(*) that could peg a
-            // core for minutes while holding query_mutex), so uptime/LB/health probes
-            // work without the token and a slow query can't starve them.
-            res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"pdbsql\",\"pdb\":\"" + json_escape(pdb_path) + "\"}", "application/json");
-        });
-
-        svr.Post("/shutdown", [&svr, &auth_token](const httplib::Request& req, httplib::Response& res) {
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
-                else if (req.has_header("Authorization")) {
-                    auto auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-            res.set_content("{\"success\":true,\"message\":\"Shutting down\"}", "application/json");
-            std::thread([&svr] {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                svr.stop();
-            }).detach();
-        });
-
-        svr.Post("/cancel", [&auth_token, &cancel_requested](const httplib::Request& req, httplib::Response& res) {
-            // Auth-guarded like /query and /shutdown. Sets the server-wide cancel flag;
-            // the in-flight /query (running on another worker thread, holding
-            // query_mutex) observes it via should_cancel and returns its partial rows.
-            // Tokenless in intent — it targets whatever query is currently executing.
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) token = req.get_header_value("X-XSQL-Token");
-                else if (req.has_header("Authorization")) {
-                    auto auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-            cancel_requested.store(true);
-            res.set_content("{\"success\":true,\"message\":\"cancel requested\"}", "application/json");
-        });
-    };
-
-    xsql::thinclient::server http_server(cfg);
+    pdbsql::PdbsqlHTTPServer http_server;
     g_http_server = &http_server;
 
     auto old_handler = std::signal(SIGINT, http_signal_handler);
@@ -292,11 +131,50 @@ int run_http_mode(const std::string& pdb_path, int port, const std::string& bind
     auto old_term_handler = std::signal(SIGTERM, http_signal_handler);
 #endif
 
-    http_server.run_async();
-    int actual_port = http_server.port();
+    const int actual_port = http_server.start(
+        port,
+        [&db](const std::string& sql, const xsql::ScriptOptions& opts) {
+            auto script = pdbsql::run_pdbsql_script(db, sql, with_default_timeout(opts));
+            annotate_timeout_guidance(script);
+            return script;
+        },
+        bind_addr, /*use_queue=*/false, auth_token, pdb_path,
+        [&db](const std::string& sql, const xsql::ScriptOptions& raw_opts, bool ndjson,
+              const pdbsql::HTTPStreamSink& sink) {
+            const xsql::ScriptOptions opts = with_default_timeout(raw_opts);
+            // Product PRAGMAs (timeout_push/pop) can't be intercepted by the
+            // generic row-by-row streamer, so route those scripts through the
+            // PRAGMA-aware executor and emit the adapted result as one chunk;
+            // ordinary data-only scripts get true O(one-row) streaming below.
+            if (pdbsql::script_has_runtime_pragma(sql)) {
+                auto script = pdbsql::run_pdbsql_script(db, sql, opts);
+                annotate_timeout_guidance(script);
+                const std::string body = ndjson
+                    ? xsql::script_result_to_jsonl(script)
+                    : xsql::script_result_to_json(script, opts.include_sql);
+                (void)sink(body.data(), body.size());
+            } else if (ndjson) {
+                xsql::stream_database_script_ndjson(db, sql, opts, sink);
+            } else {
+                xsql::stream_database_script_json(db, sql, opts, sink);
+            }
+        });
 
-    printf("HTTP server listening on http://%s:%d\n", cfg.bind_address.c_str(), actual_port);
-    printf("Endpoints: /help, /query, /status, /shutdown\n");
+    if (actual_port <= 0) {
+        fprintf(stderr, "Error: failed to start HTTP server\n");
+        std::signal(SIGINT, old_handler);
+#ifdef _WIN32
+        std::signal(SIGBREAK, old_break_handler);
+#else
+        std::signal(SIGTERM, old_term_handler);
+#endif
+        g_http_server = nullptr;
+        return 1;
+    }
+
+    printf("HTTP server listening on http://%s:%d\n",
+           bind_addr.empty() ? "127.0.0.1" : bind_addr.c_str(), actual_port);
+    printf("Endpoints: /help, /query, /cancel, /status, /shutdown\n");
     printf("Example: curl http://localhost:%d/help\n", actual_port);
     printf("Press Ctrl+C to stop.\n\n");
     fflush(stdout);

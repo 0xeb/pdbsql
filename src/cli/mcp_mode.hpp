@@ -9,7 +9,10 @@
 #ifdef PDBSQL_HAS_MCP
 
 #include <string>
+#include <vector>
 
-int run_mcp_mode(const std::string& pdb_path, int port, const std::string& bind_addr);
+int run_mcp_mode(const std::string& pdb_path, int port, const std::string& bind_addr,
+                 bool warm_file_index = false,
+                 const std::vector<std::string>& warm_tables = {});
 
 #endif

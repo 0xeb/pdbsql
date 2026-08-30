@@ -163,8 +163,9 @@ inline CommandResult handle_command(
                      "  .mcp stop       Stop MCP server\n"
                      "  .mcp help       Show this help\n"
                      "\n"
-                     "The MCP server exposes one tool:\n"
+                     "The MCP server exposes two tools:\n"
                      "  pdbsql_query  - Execute SQL query directly\n"
+                     "  pdbsql_help   - Full reference: schema, patterns, performance traps\n"
                      "\n"
                      "Connect with Claude Desktop by adding to config:\n"
                      "  {\"mcpServers\": {\"pdbsql\": {\"url\": \"http://127.0.0.1:<port>/sse\"}}}\n";

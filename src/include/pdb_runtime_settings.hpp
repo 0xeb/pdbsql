@@ -12,9 +12,8 @@
 namespace pdbsql {
 
 // pdbsql has no product-specific runtime keys, so it uses the shared
-// xsql::runtime::RuntimeSettingsCore directly (like ghidrasql/r2sql), exposed as
-// a process singleton (like idasql/bnsql's runtime_settings()). query_timeout_ms
-// defaults to the family standard 60000 ms; callers read it fresh and pass it as
+// xsql::runtime::RuntimeSettingsCore directly, exposed as a process singleton.
+// query_timeout_ms defaults to 60000 ms; callers read it fresh and pass it as
 // ScriptOptions::timeout_ms / QueryOptions::timeout_ms per query.
 inline xsql::runtime::RuntimeSettingsCore& runtime_settings() {
     static xsql::runtime::RuntimeSettingsCore instance;

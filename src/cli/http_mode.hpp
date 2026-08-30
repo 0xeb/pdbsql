@@ -9,8 +9,11 @@
 #ifdef PDBSQL_HAS_HTTP
 
 #include <string>
+#include <vector>
 
 int run_http_mode(const std::string& pdb_path, int port,
-                  const std::string& bind_addr, const std::string& auth_token);
+                  const std::string& bind_addr, const std::string& auth_token,
+                  bool warm_file_index = false,
+                  const std::vector<std::string>& warm_tables = {});
 
 #endif
