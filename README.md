@@ -1,5 +1,12 @@
 # pdbsql
 
+<p align="center">
+  <a href="https://github.com/0xeb/pdbsql/releases/latest"><img alt="Download pdbsql" src="https://img.shields.io/badge/Download-pdbsql-1e6fd9?style=for-the-badge"></a>
+  <a href="https://paypal.me/EliasBachaalany"><img alt="Donate with PayPal" src="https://img.shields.io/badge/Donate-PayPal-0070e0?style=for-the-badge&logo=paypal&logoColor=white"></a>
+  <a href="https://buymeacoffee.com/0xeb"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black"></a>
+  <a href="https://github.com/0xeb/pdbsql"><img alt="Star pdbsql on GitHub" src="https://img.shields.io/github/stars/0xeb/pdbsql?style=for-the-badge&logo=github&label=Star&color=24292f"></a>
+</p>
+
 Query Windows PDB files with SQL.
 
 ```
@@ -310,6 +317,18 @@ cmake --build build --config Release
 **Build options:**
 - `PDBSQL_WITH_HTTP=ON` (default): HTTP REST server
 - `PDBSQL_WITH_MCP=ON` (default): MCP server (SSE), fetches fastmcpp
+
+## Support
+
+If pdbsql saves you time, a donation funds the next release, and a star helps others find it.
+
+<p>
+  <a href="https://paypal.me/EliasBachaalany"><img alt="Donate with PayPal" src="https://img.shields.io/badge/Donate-PayPal-0070e0?style=for-the-badge&logo=paypal&logoColor=white"></a>
+  <a href="https://buymeacoffee.com/0xeb"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black"></a>
+  <a href="https://github.com/0xeb/pdbsql"><img alt="Star pdbsql on GitHub" src="https://img.shields.io/github/stars/0xeb/pdbsql?style=for-the-badge&logo=github&label=Star&color=24292f"></a>
+</p>
+
+Bug reports with a minimal reproduction are just as valuable.
 
 ## License and Terms of Use
 
