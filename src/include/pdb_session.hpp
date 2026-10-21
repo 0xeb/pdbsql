@@ -8,12 +8,27 @@
 // pdb_session.hpp - PDB file session management
 
 #include "dia_helpers.hpp"
+#include <algorithm>
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 namespace pdbsql {
+
+// One symbol of a table's rva index: its start rva and its symIndexId. 8 bytes.
+struct RvaIndexEntry {
+    DWORD rva = 0;
+    DWORD id = 0;
+};
+
+// Every symbol of one table (one global findChildren(tag) walk), stable-sorted by
+// rva: ties keep the walk's order. symIndexId is only meaningful within the
+// session that assigned it, so an index lives and dies with its session.
+using RvaIndex = std::vector<RvaIndexEntry>;
 
 // ============================================================================
 // PDB Session - manages DIA lifecycle for a PDB file
@@ -29,20 +44,12 @@ public:
     PdbSession& operator=(const PdbSession&) = delete;
 
     // Move semantics
-    PdbSession(PdbSession&& other) noexcept {
-        source_ = std::move(other.source_);
-        session_ = std::move(other.session_);
-        global_ = std::move(other.global_);
-        path_ = std::move(other.path_);
-    }
+    PdbSession(PdbSession&& other) noexcept { take(other); }
 
     PdbSession& operator=(PdbSession&& other) noexcept {
         if (this != &other) {
             close();
-            source_ = std::move(other.source_);
-            session_ = std::move(other.session_);
-            global_ = std::move(other.global_);
-            path_ = std::move(other.path_);
+            take(other);
         }
         return *this;
     }
@@ -102,7 +109,12 @@ public:
         return true;
     }
 
+    // Drops the DIA session and everything derived from it: the warm-up flags and
+    // the rva indexes describe this PDB's session and are wrong for the next one.
     void close() {
+        rva_indexes_.clear();
+        warmed_symtags_.clear();
+        file_index_warmed_ = false;
         global_.Release();
         session_.Release();
         source_.Release();
@@ -185,18 +197,6 @@ public:
             session_->findSymbolByRVA(rva, symtag, &result);
         }
         return result;
-    }
-
-    // Address-ordered symbol enumerator (all symbol kinds, by RVA). Used for a
-    // BOUNDED range predicate (`WHERE rva BETWEEN a AND b`): the caller seeks with
-    // symbolByRVA(start) -- which returns the symbol AT-OR-AFTER start directly, not
-    // just positioning the cursor -- then walks forward with Next() until past the
-    // upper bound. The seek itself is not O(1)/indexed, so this is meant for a single
-    // bounded query or an occasional reconnect, not repeated per-page seeking.
-    CComPtr<IDiaEnumSymbolsByAddr> symbols_by_addr() {
-        CComPtr<IDiaEnumSymbolsByAddr> by_addr;
-        if (session_) session_->getSymbolsByAddr(&by_addr);
-        return by_addr;
     }
 
     // Get symbol count for a type. Delegates straight to DIA's enumerator count
@@ -306,7 +306,71 @@ public:
         return true;
     }
 
+    // The rva index of `tag`'s table (every symbol's (rva, symIndexId), rva-sorted),
+    // built on first use and kept for the life of the session. Building it is one
+    // global findChildren(tag) walk reading only rva and id per symbol -- the cost
+    // of the walk, without the name/demangle extraction of a scan. Every later
+    // call is free, so a range query over the table becomes a binary search plus
+    // one symbolById per row it returns.
+    //
+    // `interrupted` is polled once per symbol during the build. When it returns
+    // true the build stops and nothing is cached: the next call starts over rather
+    // than serving a partial index. Returns nullptr then. A table DIA cannot
+    // enumerate yields an empty index that is not cached either.
+    //
+    // Memory: 8 bytes per symbol of the table (RvaIndexEntry).
+    //
+    // Unlike a symbol-count cache (see count_symbols), this does not duplicate
+    // anything DIA keeps: DIA has no complete per-table address order (its
+    // by-address enumerator yields one symbol per address), so without the index
+    // every range query would repeat the whole walk.
+    std::shared_ptr<const RvaIndex> rva_index(enum SymTagEnum tag,
+                                              const std::function<bool()>& interrupted) {
+        auto cached = rva_indexes_.find(tag);
+        if (cached != rva_indexes_.end()) return cached->second;
+
+        auto index = std::make_shared<RvaIndex>();
+        CComPtr<IDiaEnumSymbols> symbols = enum_symbols(tag);
+        if (!symbols) return index;
+        LONG count = 0;
+        if (SUCCEEDED(symbols->get_Count(&count)) && count > 0) {
+            index->reserve(static_cast<size_t>(count));
+        }
+        for (;;) {
+            if (interrupted && interrupted()) return nullptr;
+            CComPtr<IDiaSymbol> symbol;
+            ULONG fetched = 0;
+            if (FAILED(symbols->Next(1, &symbol, &fetched)) || fetched != 1) break;
+            RvaIndexEntry entry;
+            symbol->get_relativeVirtualAddress(&entry.rva);
+            symbol->get_symIndexId(&entry.id);
+            index->push_back(entry);
+        }
+        std::stable_sort(index->begin(), index->end(),
+                         [](const RvaIndexEntry& a, const RvaIndexEntry& b) { return a.rva < b.rva; });
+        index->shrink_to_fit();
+        rva_indexes_.emplace(tag, index);
+        return index;
+    }
+
+    // Whether `tag`'s rva index is built (tests: an interrupted build caches nothing).
+    bool has_rva_index(enum SymTagEnum tag) const { return rva_indexes_.count(tag) != 0; }
+
 private:
+    void take(PdbSession& other) {
+        source_ = std::move(other.source_);
+        session_ = std::move(other.session_);
+        global_ = std::move(other.global_);
+        path_ = std::move(other.path_);
+        last_error_ = std::move(other.last_error_);
+        file_index_warmed_ = other.file_index_warmed_;
+        warmed_symtags_ = std::move(other.warmed_symtags_);
+        rva_indexes_ = std::move(other.rva_indexes_);
+        other.file_index_warmed_ = false;
+        other.warmed_symtags_.clear();
+        other.rva_indexes_.clear();
+    }
+
     ComInit com_;  // Must be first - initializes COM
     CComPtr<IDiaDataSource> source_;
     CComPtr<IDiaSession> session_;
@@ -315,6 +379,7 @@ private:
     std::string last_error_;
     bool file_index_warmed_ = false;
     std::set<enum SymTagEnum> warmed_symtags_;
+    std::map<enum SymTagEnum, std::shared_ptr<const RvaIndex>> rva_indexes_;
 };
 
 // Maps a `--warm-tables` CLI table name to the SymTagEnum `ensure_symtag_warm()`

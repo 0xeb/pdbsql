@@ -16,6 +16,7 @@
 #include <fastmcpp/tools/manager.hpp>
 #include <fastmcpp/tools/tool.hpp>
 #include <nlohmann/json.hpp>
+#include <xsql/thinclient/clipboard.hpp>
 
 #include <chrono>
 #include <random>
@@ -325,15 +326,22 @@ void PdbsqlMCPServer::complete_pending_commands(const std::string& result) {
 }
 
 std::string PdbsqlMCPServer::url() const {
-    std::ostringstream ss;
-    ss << "http://" << bind_addr_ << ":" << port_;
-    return ss.str();
+    return "http://" + xsql::thinclient::format_url_host(bind_addr_) + ":" +
+           std::to_string(port_);
 }
 
-std::string format_mcp_info(int port) {
+std::string format_mcp_info(int port, const std::string& bind_addr) {
+    // The endpoint line names the listening socket (a wildcard bind as bound);
+    // the client config is dialed, so a wildcard bind is shown through its
+    // loopback. Both bracket an IPv6 host.
+    const std::string port_path = ":" + std::to_string(port) + "/sse";
+    const std::string sse_url =
+        "http://" + xsql::thinclient::format_url_host(bind_addr) + port_path;
+    const std::string client_url =
+        "http://" + xsql::thinclient::format_connect_url_host(bind_addr) + port_path;
     std::ostringstream ss;
     ss << "MCP server started on port " << port << "\n";
-    ss << "SSE endpoint: http://127.0.0.1:" << port << "/sse\n\n";
+    ss << "SSE endpoint: " << sse_url << "\n\n";
 
     ss << "Available tools:\n";
     ss << "  pdbsql_query  - Execute SQL query directly\n";
@@ -344,23 +352,11 @@ std::string format_mcp_info(int port) {
     ss << "{\n";
     ss << "  \"mcpServers\": {\n";
     ss << "    \"pdbsql\": {\n";
-    ss << "      \"url\": \"http://127.0.0.1:" << port << "/sse\"\n";
+    ss << "      \"url\": \"" << client_url << "\"\n";
     ss << "    }\n";
     ss << "  }\n";
     ss << "}\n";
 
-    return ss.str();
-}
-
-std::string format_mcp_status(int port, bool running) {
-    std::ostringstream ss;
-    if (running) {
-        ss << "MCP server running on port " << port << "\n";
-        ss << "SSE endpoint: http://127.0.0.1:" << port << "/sse\n";
-    } else {
-        ss << "MCP server not running\n";
-        ss << "Use '.mcp start' to start\n";
-    }
     return ss.str();
 }
 

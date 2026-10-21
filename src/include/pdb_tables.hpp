@@ -1163,59 +1163,81 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
-// Parses GE/GT/LT/LE constraint args on line_numbers.rva into a normalized
-// half-open [start, end) range and builds LineNumbersByRvaRangeGenerator for
-// it. Falls back to the full unfiltered walk (LineNumberGenerator) when the
-// range isn't fully bounded (only one side given -- e.g. a bare
-// `WHERE rva >= X` with no upper bound, which DIA's findLinesByRVA can't
-// take a finite length for) or is empty/inverted. SQLite's own constraint
-// re-check (omit=false, same as the LIKE pushdown) still guarantees a
-// correct final result either way -- this only affects whether the fast
-// path applies, never correctness.
+// The inclusive DWORD rva window GT/GE/LT/LE constraints select, compared the
+// way SQLite compares the INTEGER rva column (the plans are omit=1: `rva >=
+// 4095.5` starts at 4096, a NULL or 'a' bound behaves as SQLite says, and
+// as_int64() used to truncate or zero all of them). Returns false when no rva
+// satisfies the constraints. `has_lower` / `has_upper` report which sides the
+// query bounded at all.
+inline bool rva_window_from_args(const std::vector<xsql::GeneratorConstraintArg>& args,
+                                 DWORD& first, DWORD& last,
+                                 bool& has_lower, bool& has_upper) {
+    xsql::Int64KeyRange range;
+    has_lower = false;
+    has_upper = false;
+    for (const auto& arg : args) {
+        switch (arg.op) {
+            case xsql::ConstraintOp::Gt:
+            case xsql::ConstraintOp::Ge: has_lower = true; break;
+            case xsql::ConstraintOp::Lt:
+            case xsql::ConstraintOp::Le: has_upper = true; break;
+            default: continue;
+        }
+        range.constrain(arg.op, arg.value);
+    }
+    constexpr int64_t kMaxRva = 0xFFFFFFFFLL;
+    if (range.empty() || range.upper() < 0 || range.lower() > kMaxRva) return false;
+    first = static_cast<DWORD>((std::max)(range.lower(), int64_t{0}));
+    last = static_cast<DWORD>((std::min)(range.upper(), kMaxRva));
+    return first <= last;
+}
+
+// The line numbers of a one-sided rva window, filtered and in rva order. The
+// range plan claims ORDER BY rva (add_constraint_range_filter), and the only
+// source for an unbounded side is the per-compiland walk, which is in neither
+// order nor range -- it used to be returned as is, every line of the PDB for
+// `WHERE rva >= X` under an omit=1 plan.
+class LineNumbersInRvaWindowGenerator : public xsql::Generator<CachedLineNumber> {
+    std::vector<CachedLineNumber> rows_;
+    size_t pos_ = 0;
+
+public:
+    LineNumbersInRvaWindowGenerator(PdbSession& session, DWORD first, DWORD last) {
+        LineNumberGenerator all(session);
+        while (all.next()) {
+            const CachedLineNumber& line = all.current();
+            if (line.rva >= first && line.rva <= last) rows_.push_back(line);
+        }
+        std::stable_sort(rows_.begin(), rows_.end(),
+                         [](const CachedLineNumber& a, const CachedLineNumber& b) {
+                             return a.rva < b.rva;
+                         });
+    }
+
+    bool next() override { return ++pos_ <= rows_.size(); }
+    const CachedLineNumber& current() const override { return rows_[pos_ - 1]; }
+    int64_t rowid() const override { return static_cast<int64_t>(pos_ - 1); }
+};
+
+// Builds the line_numbers rva-range source. A window bounded on both sides goes
+// to LineNumbersByRvaRangeGenerator (DIA's findLinesByRVA, see its comment). A
+// one-sided window has no finite length to hand findLinesByRVA, so it filters
+// the full walk instead (see
+// LineNumbersInRvaWindowGenerator). The plan is omit=1 either way: SQLite does
+// not re-check rva, so both must return exactly the window.
 inline std::unique_ptr<xsql::Generator<CachedLineNumber>> make_line_numbers_rva_range_generator(
         PdbSession& session, const std::vector<xsql::GeneratorConstraintArg>& args) {
-    constexpr DWORD kMaxRva = 0xFFFFFFFFu;
-    auto as_rva = [kMaxRva](const xsql::FunctionArg& v) -> DWORD {
-        int64_t i = v.as_int64();
-        if (i < 0) return 0;
-        if (i > static_cast<int64_t>(kMaxRva)) return kMaxRva;
-        return static_cast<DWORD>(i);
-    };
-    auto saturating_next = [kMaxRva](DWORD rva) { return rva >= kMaxRva ? kMaxRva : rva + 1; };
-
-    DWORD start = 0;
-    DWORD end = kMaxRva;
-    bool has_start = false;
-    bool has_end = false;
-    for (const auto& arg : args) {
-        const DWORD rva = as_rva(arg.value);
-        switch (arg.op) {
-            case xsql::ConstraintOp::Ge:
-                start = has_start ? (std::max)(start, rva) : rva;
-                has_start = true;
-                break;
-            case xsql::ConstraintOp::Gt: {
-                const DWORD next = saturating_next(rva);
-                start = has_start ? (std::max)(start, next) : next;
-                has_start = true;
-                break;
-            }
-            case xsql::ConstraintOp::Le:
-                end = has_end ? (std::min)(end, saturating_next(rva)) : saturating_next(rva);
-                has_end = true;
-                break;
-            case xsql::ConstraintOp::Lt:
-                end = has_end ? (std::min)(end, rva) : rva;
-                has_end = true;
-                break;
-            default: break;
-        }
+    DWORD first = 0;
+    DWORD last = 0;
+    bool has_lower = false;
+    bool has_upper = false;
+    if (!rva_window_from_args(args, first, last, has_lower, has_upper)) return nullptr;
+    const uint64_t length = static_cast<uint64_t>(last) - first + 1;
+    if (has_lower && has_upper && length <= 0xFFFFFFFFull) {
+        return std::make_unique<LineNumbersByRvaRangeGenerator>(
+            session, first, static_cast<DWORD>(length));
     }
-
-    if (has_start && has_end && end > start) {
-        return std::make_unique<LineNumbersByRvaRangeGenerator>(session, start, end - start);
-    }
-    return std::make_unique<LineNumberGenerator>(session);
+    return std::make_unique<LineNumbersInRvaWindowGenerator>(session, first, last);
 }
 
 class SectionGenerator : public xsql::Generator<CachedSection> {
@@ -1751,7 +1773,11 @@ inline void add_filter_eq(GeneratorTableDef<RowData>& def,
     def.filters.emplace_back(
         col_idx, filter_id, cost, est_rows,
         [factory = std::move(factory)](xsql::FunctionArg val) -> std::unique_ptr<xsql::RowIterator> {
-            return factory(val.as_int64());
+            // omit=1: a value no integer key equals (10.5, 'a', NULL) has no
+            // rows; as_int64() used to look up 10, 0 and 0.
+            const std::optional<int64_t> key = xsql::exact_int64(val);
+            if (!key) return nullptr;
+            return factory(*key);
         });
 }
 
@@ -1767,8 +1793,10 @@ inline void add_filter_eq_text(GeneratorTableDef<RowData>& def,
     def.filters.emplace_back(
         col_idx, filter_id, cost, est_rows,
         [factory = std::move(factory)](xsql::FunctionArg val) -> std::unique_ptr<xsql::RowIterator> {
-            const char* text = val.as_c_str();
-            return factory(text ? text : "");
+            // omit=1: NULL equals no name and a blob never equals text.
+            const std::optional<std::string> text = xsql::exact_text(val);
+            if (!text) return nullptr;
+            return factory(text->c_str());
         });
 }
 
@@ -1831,6 +1859,39 @@ inline void add_constraint_range_filter(
     def.constraint_filters.push_back(std::move(cf));
 }
 
+// Two-sided sibling of add_constraint_range_filter: matches only a window
+// bounded on both sides (a GT/GE lower bound AND an LT/LE upper bound), so it
+// can be priced apart from the one-sided form when the two cost very
+// differently (line_numbers: a bounded window is one findLinesByRVA call, a
+// one-sided one walks every line of the PDB). Registered as one constraint
+// filter per lower x upper operator pair, each with both bounds required; the
+// factory receives the two bounds. Ordered ascending, like the one-sided form.
+template<typename RowData>
+inline void add_constraint_window_filter(
+        GeneratorTableDef<RowData>& def,
+        const char* column_name,
+        std::function<std::unique_ptr<xsql::Generator<RowData>>(
+            const std::vector<xsql::GeneratorConstraintArg>&)> factory,
+        double cost,
+        double est_rows) {
+    int col_idx = def.find_column(column_name ? column_name : "");
+    if (col_idx < 0) return;
+    for (const auto lower : {xsql::ConstraintOp::Ge, xsql::ConstraintOp::Gt}) {
+        for (const auto upper : {xsql::ConstraintOp::Lt, xsql::ConstraintOp::Le}) {
+            xsql::ConstraintFilterDef<RowData> cf;
+            cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, lower, true, ""});
+            cf.specs.push_back(xsql::GeneratorConstraintSpec{col_idx, upper, true, ""});
+            cf.filter_id = xsql::CONSTRAINT_FILTER_BASE + static_cast<int>(def.constraint_filters.size());
+            cf.estimated_cost = cost;
+            cf.estimated_rows = est_rows;
+            cf.ordered_column = col_idx;
+            cf.ordered_desc = false;
+            cf.create = factory;
+            def.constraint_filters.push_back(std::move(cf));
+        }
+    }
+}
+
 // Projection-aware sibling of add_constraint_range_filter: the factory also
 // receives SQLite's colUsed bitmask (xsql::ConstraintFilterDef::
 // create_with_col_used), so a range-pushdown generator can skip an expensive
@@ -1838,7 +1899,7 @@ inline void add_constraint_range_filter(
 // symbol_projection_from()/SymbolProjection already applies to the default
 // full-scan path (functions_/publics_'s .projection_generator()), extended
 // here to the range-filter path. Motivated by a real, cost: on
-// a large PDB, demangling 500 rows via SymbolRangeGenerator's unconditional
+// a large PDB, demangling 500 rows via the range generator's unconditional
 // extract_symbol(symbol) (default SymbolProjection{}, undecorated=true) cost
 // ~20s even when the query only selected `rva` -- see
 // the 2026-08-24 measurement series' "later"
@@ -1846,14 +1907,21 @@ inline void add_constraint_range_filter(
 // surfaced this gap. Unlike that declined fix, skipping unselected work is
 // a pure win with no PDB-dependent tradeoff -- it never does MORE work than
 // the unprojected path, only ever equal or less.
+//
+// `descending` registers the filter as ordered DESC on the column (the generator
+// must then emit in descending order). A table that registers an ascending and a
+// descending twin with the same cost gets ORDER BY <col> DESC consumed too: on a
+// cost tie libxsql prefers the filter that consumes the ORDER BY, and without one
+// the first registered (ascending) stays.
 template<typename RowData>
 inline void add_constraint_range_filter_projection(
         GeneratorTableDef<RowData>& def,
         const char* column_name,
         std::function<std::unique_ptr<xsql::Generator<RowData>>(
             const std::vector<xsql::GeneratorConstraintArg>&, uint64_t)> factory,
-        double cost = 5.0,
-        double est_rows = 1000.0) {
+        double cost,
+        double est_rows,
+        bool descending) {
     int col_idx = def.find_column(column_name ? column_name : "");
     if (col_idx < 0) return;
     xsql::ConstraintFilterDef<RowData> cf;
@@ -1865,7 +1933,7 @@ inline void add_constraint_range_filter_projection(
     cf.estimated_cost = cost;
     cf.estimated_rows = est_rows;
     cf.ordered_column = col_idx;
-    cf.ordered_desc = false;
+    cf.ordered_desc = descending;
     cf.create_with_col_used = std::move(factory);
     def.constraint_filters.push_back(std::move(cf));
 }
@@ -2184,19 +2252,17 @@ inline bool is_data_table_kind(IDiaSymbol* symbol) {
 // so we confirm the exact start to honor `WHERE rva = X` (SQLite omits the recheck).
 //
 // KNOWN LIMITATION, not assumed: when MULTIPLE symbols genuinely share the
-// exact same start rva (observed on data: CFG guard-check symbols like
-// `__guard_xfg_check_icall_fptr` legitimately appear as several distinct ids at one
-// address), findSymbolByRVA returns exactly one of them, not the full tied set -- a
-// manual scan filtered to that rva can return more rows than this pushdown does.
-// Deliberately not "fixed" by switching to IDiaEnumSymbolsByAddr's seek-and-walk (the
-// only DIA API that could enumerate ties): that primitive has an erratic, landing-
-// dependent cost (0.05-28.6s, directly against DIA) vs.
-// findSymbolByRVA's low-single-digit-ms typical cost (direct DIA
-// measurement) -- paying that for every rva= lookup to cover a rare tie
-// would regress
-// the common case to fix an edge case whose duplicate rows are typically near-identical
-// aliases anyway. If exact completeness under ties is ever required, add an opt-in
-// TVF/pragma rather than changing this filter's default cost profile.
+// exact same start rva (CFG guard-check data symbols like
+// `__guard_xfg_check_icall_fptr`; identical-COMDAT-folded functions, which can be
+// thousands at one address on an optimized build; a function's public alias),
+// findSymbolByRVA returns exactly one of them, not the full tied set -- a manual
+// scan filtered to that rva can return more rows than this pushdown does. DIA has
+// no cheap "every symbol at this address" lookup: the by-address enumerator also
+// yields one symbol per address, and findChildrenExByRVA rejects SymTagFunction.
+// The complete tied set comes only from the table's full walk, which is what the
+// functions/publics rva-range plan pays (SymbolsInRvaWindowGenerator), so
+// `WHERE rva >= X AND rva <= X` is the exact form at that cost. Making `rva = X`
+// pay it too would turn a millisecond lookup into a whole-table walk.
 class SymbolByRvaGenerator : public xsql::Generator<CachedSymbol> {
     PdbSession& session_;
     DWORD rva_ = 0;
@@ -2287,133 +2353,108 @@ public:
     int64_t rowid() const override { return rowid_; }
 };
 
-// Emits symbols of `tag_` whose rva falls within a bounded, half-open [start_, end_)
-// range, via DIA's address-ordered enumerator: one symbolByRVA seek to `start_`, then
-// a linear Next() walk that stops as soon as it passes `end_`. This is a BOUNDED-RANGE
-// primitive (`WHERE rva BETWEEN a AND b`) and a reconnect/resume aid for a dropped bulk
-// pull -- NOT a per-page pagination mechanism: the seek itself is not O(1)/indexed, so
-// reseeking once per page is worse than one linear pull. A single bounded seek pays
-// that cost once, which is fine for an actual range query or an occasional reconnect
-// -- do not repurpose this for OFFSET-style paging of a whole table.
+// Emits the symbols of `tag_` whose rva lies in the inclusive window [first_, last_],
+// in rva order (descending when `descending`): exactly the table's full scan (the
+// same global findChildren(tag) walk SymbolGenerator streams) restricted to the
+// window. The range plans are omit=1 and claim ORDER BY rva, so nothing re-checks
+// or re-sorts these rows.
 //
-// The by-address stream interleaves all symbol kinds, so `tag_` is filtered here.
-class SymbolRangeGenerator : public xsql::Generator<CachedSymbol> {
+// DIA has no address-ordered source that is complete per tag. The by-address
+// enumerator (IDiaEnumSymbolsByAddr) yields ONE symbol per address, so it hides
+// every other symbol that starts there: a function whose start a data symbol also
+// names, most publics (the function at the same address wins), and every
+// identical-COMDAT-folded function but one -- often a large share of the functions
+// of an optimized build, many thousands at one address. findChildrenExByRVA rejects
+// SymTagFunction (E_INVALIDARG) and misses addressless rva-0 publics, and
+// findSymbolByRVA returns one symbol. So the window comes from the session's rva
+// index of the table (PdbSession::rva_index): every symbol's (rva, symIndexId),
+// rva-sorted, built from the full walk the first time any range query touches the
+// table and kept for the session. The window is two binary searches over it; each
+// row is resolved through symbolById as it is emitted.
+//
+// Cost: the first range query on a table in a session pays the index walk
+// (seconds on a large PDB, milliseconds on a small one); every later one, any
+// window, costs the binary search plus its own rows, and LIMIT stops it early.
+// The build polls the query deadline; an interrupted build caches nothing.
+class SymbolsInRvaWindowGenerator : public xsql::Generator<CachedSymbol> {
     PdbSession& session_;
     enum SymTagEnum tag_;
-    DWORD start_ = 0;              // inclusive lower bound
-    DWORD end_ = 0xFFFFFFFFu;      // exclusive upper bound (only checked if has_end_)
-    bool has_end_ = false;
-    std::function<bool(IDiaSymbol*)> accept_;
-    SymbolProjection proj_;        // default {} (undecorated=true) -- see 4-arg ctor
-    CComPtr<IDiaEnumSymbolsByAddr> by_addr_;
-    CComPtr<IDiaSymbol> pending_;  // the symbol returned directly by the symbolByRVA seek
-    CachedSymbol current_;
-    int64_t rowid_ = -1;
+    DWORD first_ = 0;
+    DWORD last_ = 0;
+    bool descending_ = false;
+    SymbolProjection proj_;
+    std::shared_ptr<const RvaIndex> index_;  // keeps the window alive past a close()
+    size_t begin_ = 0;                       // the window is index_[begin_, end_)
+    size_t end_ = 0;
+    size_t emitted_ = 0;                     // rows of the window consumed so far
+    size_t pos_ = 0;                         // index_ position of the current row
     bool started_ = false;
     bool done_ = false;
-    unsigned scanned_ = 0;  // skip-loop counter for the cooperative cancellation poll
+    CachedSymbol current_;
+
+    // Locates the window in the table's rva index, building the index on first
+    // use. Returns false when the build was interrupted (the query timeout /
+    // cancel set the vtab error already).
+    bool locate_window() {
+        unsigned scanned = 0;
+        index_ = session_.rva_index(tag_, [&scanned]() {
+            return parent_walk_interrupted(scanned, "symbols to index by rva");
+        });
+        if (!index_) return false;
+        const auto lo = std::lower_bound(
+            index_->begin(), index_->end(), first_,
+            [](const RvaIndexEntry& e, DWORD rva) { return e.rva < rva; });
+        const auto hi = std::upper_bound(
+            lo, index_->end(), last_,
+            [](DWORD rva, const RvaIndexEntry& e) { return rva < e.rva; });
+        begin_ = static_cast<size_t>(lo - index_->begin());
+        end_ = static_cast<size_t>(hi - index_->begin());
+        return true;
+    }
 
 public:
-    SymbolRangeGenerator(PdbSession& session, enum SymTagEnum tag, DWORD start, DWORD end, bool has_end,
-                        std::function<bool(IDiaSymbol*)> accept = nullptr)
-        : session_(session), tag_(tag), start_(start), end_(end), has_end_(has_end), accept_(std::move(accept)) {}
-
-    // Projection-aware overload: skips the demangle (SymbolProjection::undecorated)
-    // when the query never selects it -- see add_constraint_range_filter_projection's
-    // doc comment for the observed cost this avoids.
-    SymbolRangeGenerator(PdbSession& session, enum SymTagEnum tag, DWORD start, DWORD end, bool has_end,
-                        SymbolProjection proj, std::function<bool(IDiaSymbol*)> accept = nullptr)
-        : session_(session), tag_(tag), start_(start), end_(end), has_end_(has_end),
-          accept_(std::move(accept)), proj_(proj) {}
+    SymbolsInRvaWindowGenerator(PdbSession& session, enum SymTagEnum tag, DWORD first, DWORD last,
+                                bool descending, SymbolProjection proj)
+        : session_(session), tag_(tag), first_(first), last_(last), descending_(descending),
+          proj_(proj) {}
 
     bool next() override {
         if (done_) return false;
         if (!started_) {
             started_ = true;
-            by_addr_ = session_.symbols_by_addr();
-            if (!by_addr_) { done_ = true; return false; }
-            by_addr_->symbolByRVA(start_, &pending_);
-        }
-        for (;;) {
-            // Cooperative cancellation INSIDE the skip loop. The three `continue`
-            // paths below (below start_, wrong tag, rejected by accept_) advance
-            // without yielding, so on a sparse tag this single next() call can walk
-            // a large stretch of the address space. The query timeout is only
-            // observed BETWEEN next() calls, so without this poll the deadline is
-            // not seen until the loop happens to produce a row. Same 1024-iteration
-            // idiom the other tools in this family use.
-            if (parent_walk_interrupted(scanned_, "symbols by address")) {
+            if (!locate_window()) {
                 done_ = true;
                 return false;
             }
+        }
+        while (emitted_ < end_ - begin_) {
+            pos_ = descending_ ? end_ - 1 - emitted_ : begin_ + emitted_;
+            ++emitted_;
             CComPtr<IDiaSymbol> symbol;
-            if (pending_) {
-                symbol = pending_;
-                pending_.Release();
-            } else {
-                CComPtr<IDiaSymbol> next_sym;
-                ULONG got = 0;
-                if (FAILED(by_addr_->Next(1, &next_sym, &got)) || got != 1) { done_ = true; return false; }
-                symbol = next_sym;
-            }
-            DWORD rva = 0, tag = 0;
-            symbol->get_relativeVirtualAddress(&rva);
-            symbol->get_symTag(&tag);
-            if (rva < start_) continue;  // symbolByRVA seeks at-or-after start_, but be defensive
-            if (has_end_ && rva >= end_) { done_ = true; return false; }  // past the upper bound: stop
-            if (static_cast<enum SymTagEnum>(tag) != tag_) continue;      // wrong kind, keep walking
-            if (accept_ && !accept_(symbol)) continue;                   // right tag, wrong kind subset
-
+            if (FAILED(session_.session()->symbolById((*index_)[pos_].id, &symbol)) || !symbol) continue;
             current_ = extract_symbol(symbol, proj_);
-            ++rowid_;
             return true;
         }
+        done_ = true;
+        return false;
     }
 
     const CachedSymbol& current() const override { return current_; }
-    int64_t rowid() const override { return rowid_; }
+    int64_t rowid() const override { return static_cast<int64_t>(pos_); }
 };
 
-// Parses GT/GE/LT/LE constraint args on one rva column into a normalized half-open
-// [start, end) range and builds the SymbolRangeGenerator for it. Saturates on the
-// DWORD range boundary (0xFFFFFFFF) when converting an exclusive bound to inclusive
-// (or vice versa). `proj` defaults to {} (compute everything) for the plain
-// (non-projection-aware) callers; make_symbol_range_generator_projection below
-// passes the real colUsed-derived projection.
+// Builds the rva-window source for GT/GE/LT/LE constraints on one rva column,
+// compared the SQLite way (rva_window_from_args); nullptr when no rva qualifies.
 inline std::unique_ptr<xsql::Generator<CachedSymbol>> make_symbol_range_generator(
         PdbSession& session, enum SymTagEnum tag,
-        const std::vector<xsql::GeneratorConstraintArg>& args,
-        std::function<bool(IDiaSymbol*)> accept = nullptr,
-        SymbolProjection proj = {}) {
-    constexpr DWORD kMaxRva = 0xFFFFFFFFu;
-    auto as_rva = [kMaxRva](const xsql::FunctionArg& v) -> DWORD {
-        int64_t i = v.as_int64();
-        if (i < 0) return 0;
-        if (i > static_cast<int64_t>(kMaxRva)) return kMaxRva;
-        return static_cast<DWORD>(i);
-    };
-    auto saturating_next = [kMaxRva](DWORD rva) { return rva >= kMaxRva ? kMaxRva : rva + 1; };
-
-    DWORD start = 0;
-    DWORD end = kMaxRva;
-    bool has_end = false;
-    for (const auto& arg : args) {
-        const DWORD rva = as_rva(arg.value);
-        switch (arg.op) {
-            case xsql::ConstraintOp::Ge: start = (std::max)(start, rva); break;
-            case xsql::ConstraintOp::Gt: start = (std::max)(start, saturating_next(rva)); break;
-            case xsql::ConstraintOp::Le:
-                end = has_end ? (std::min)(end, saturating_next(rva)) : saturating_next(rva);
-                has_end = true;
-                break;
-            case xsql::ConstraintOp::Lt:
-                end = has_end ? (std::min)(end, rva) : rva;
-                has_end = true;
-                break;
-            default: break;
-        }
-    }
-    return std::make_unique<SymbolRangeGenerator>(session, tag, start, end, has_end, proj, std::move(accept));
+        const std::vector<xsql::GeneratorConstraintArg>& args, bool descending,
+        SymbolProjection proj) {
+    DWORD first = 0;
+    DWORD last = 0;
+    bool has_lower = false;
+    bool has_upper = false;
+    if (!rva_window_from_args(args, first, last, has_lower, has_upper)) return nullptr;
+    return std::make_unique<SymbolsInRvaWindowGenerator>(session, tag, first, last, descending, proj);
 }
 
 class CompilandByNameGenerator : public xsql::Generator<CachedCompiland> {
@@ -3245,8 +3286,12 @@ inline GeneratorTableDef<CachedSymbol> define_symbol_at_table(PdbSession& sessio
         .parametric_filter({"addr"},
             [&session](const std::vector<xsql::FunctionArg>& args)
                 -> std::unique_ptr<xsql::Generator<CachedSymbol>> {
-                const int64_t addr = args.empty() ? -1 : args[0].as_int64();
-                return std::make_unique<SymbolAtRvaGenerator>(session, addr);
+                // omit=1 hidden input: an addr no integer equals (4096.5, NULL)
+                // looks nothing up; as_int64() used to probe 4096 and 0.
+                const std::optional<int64_t> addr =
+                    args.empty() ? std::nullopt : xsql::exact_int64(args[0]);
+                if (!addr) return nullptr;
+                return std::make_unique<SymbolAtRvaGenerator>(session, *addr);
             },
             1.0, 1.0)
         .full_scan_error("symbol_at requires an address: SELECT * FROM symbol_at(0x1234) "
@@ -3631,6 +3676,83 @@ class TableRegistry {
         db.create_table(def.name.c_str(), module_name.c_str());
     }
 
+    // Planner cost of the functions/publics rva range. The first range query on a
+    // table in a session walks the whole table to build its rva index (reading
+    // rva and id only, so cheaper than a scan, which also extracts every row);
+    // later ones are a binary search plus the window. Priced well above the id /
+    // name / LIKE-prefix lookups, which touch only their own rows, and below a
+    // full scan (kSymbolRowEstimate), so a bare range still pushes down and a
+    // range that drives a join's inner loop still beats rescanning the table per
+    // outer row.
+    static constexpr double kRvaRangeCost = static_cast<double>(kSymbolRowEstimate) / 10.0;
+
+    // Pushdown filters of a global-scope symbol table with an exact-start rva
+    // range: functions and publics. libxsql's planner lets every filter kind
+    // compete on cost, so the lookups win over the range when both match:
+    // id (1) < name (5) < name LIKE prefix (8) < range (kRvaRangeCost) < full
+    // scan, and SQLite applies the range to the lookup's rows.
+    void add_symbol_table_filters(GeneratorTableDef<CachedSymbol>& def, enum SymTagEnum tag) {
+        auto* table = &def;
+        add_filter_eq(def, "id",
+                      [table, this, tag](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
+                          if (id <= 0 || id > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(table, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              table,
+                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), tag));
+                      },
+                      1.0, 1.0);
+        add_filter_eq_text(def, "name",
+                           [table, this, tag](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+                               return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                   table,
+                                   std::make_unique<SymbolByNameGenerator>(session_, tag, name ? name : ""));
+                           },
+                           5.0, 10.0);
+        // WHERE name LIKE 'prefix%': DIA glob pushdown, 3-8x faster than a full
+        // walk-and-compare (direct DIA measurement). Superset only --
+        // libxsql leaves the constraint unconsumed and re-checks exactly.
+        add_filter_like_text(def, "name",
+                             [table, this, tag](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
+                                 return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                                     table,
+                                     std::make_unique<SymbolByGlobGenerator>(session_, tag, pattern ? pattern : "",
+                                                                             symbol_projection_from(col_used, 2)));
+                             },
+                             8.0, 1000.0);
+        // WHERE rva = X: direct DIA address-index lookup (findSymbolByRVA), not a
+        // walk; one symbol even where several start at X (see SymbolByRvaGenerator).
+        add_filter_eq(def, "rva",
+                      [table, this, tag](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
+                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
+                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(table, nullptr);
+                          }
+                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
+                              table,
+                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), tag));
+                      },
+                      1.0, 1.0);
+        // WHERE rva > / >= / < / <= X (and BETWEEN, which SQLite expands to a GE+LE
+        // pair): the full scan restricted to the window, from the session's rva
+        // index of the table (SymbolsInRvaWindowGenerator). Registered twice, an
+        // ascending and a descending twin, so both ORDER BY rva and ORDER BY rva
+        // DESC are consumed and a LIMIT stops after its rows.
+        // _projection: skips the demangle when `undecorated` isn't selected -- see
+        // add_constraint_range_filter_projection's doc comment for the observed cost
+        // (~20s for 500 rows on a large PDB) this avoids.
+        for (const bool descending : {false, true}) {
+            add_constraint_range_filter_projection<CachedSymbol>(
+                def, "rva",
+                [this, tag, descending](const std::vector<xsql::GeneratorConstraintArg>& args,
+                                        uint64_t col_used) {
+                    return make_symbol_range_generator(session_, tag, args, descending,
+                                                        symbol_projection_from(col_used, 2));
+                },
+                kRvaRangeCost, 1000.0, descending);
+        }
+    }
+
 public:
     explicit TableRegistry(PdbSession& session)
         : session_(session)
@@ -3658,106 +3780,8 @@ public:
         , runtime_settings_(xsql::runtime::define_runtime_settings_table(
               pdbsql::runtime_settings(), "pdbsql"))
     {
-        auto* functions_def = &functions_;
-        add_filter_eq(functions_, "id",
-                      [functions_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
-                          if (id <= 0 || id > 0xFFFFFFFFLL) {
-                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(functions_def, nullptr);
-                          }
-                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                              functions_def,
-                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), SymTagFunction));
-                      },
-                      1.0, 1.0);
-        add_filter_eq_text(functions_, "name",
-                           [functions_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
-                               return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                                   functions_def,
-                                   std::make_unique<SymbolByNameGenerator>(session_, SymTagFunction, name ? name : ""));
-                           },
-                           5.0, 10.0);
-        // WHERE name LIKE 'prefix%': DIA glob pushdown, 3-8x faster than a full
-        // walk-and-compare (direct DIA measurement). Superset only --
-        // libxsql leaves the constraint unconsumed and re-checks exactly.
-        add_filter_like_text(functions_, "name",
-                             [functions_def, this](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
-                                 return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                                     functions_def,
-                                     std::make_unique<SymbolByGlobGenerator>(session_, SymTagFunction, pattern ? pattern : "",
-                                                                             symbol_projection_from(col_used, 2)));
-                             },
-                             8.0, 1000.0);
-        // WHERE rva = X: direct DIA address-index lookup (findSymbolByRVA), not a full
-        // walk. Cache-free; cost=1 so the planner strongly prefers it over a scan.
-        add_filter_eq(functions_, "rva",
-                      [functions_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
-                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
-                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(functions_def, nullptr);
-                          }
-                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                              functions_def,
-                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagFunction));
-                      },
-                      1.0, 1.0);
-        // Bounded WHERE rva > / >= / < / <= X (and BETWEEN, which SQLite expands to a
-        // GE+LE pair): one symbolByRVA seek + a linear walk stopping at the upper
-        // bound. A reconnect/resume aid and a genuine analytical range query -- NOT a
-        // per-page pagination mechanism (see SymbolRangeGenerator's doc comment).
-        // _projection: skips the demangle when `undecorated` isn't selected -- see
-        // add_constraint_range_filter_projection's doc comment for the observed cost
-        // (~20s for 500 rows on a large PDB) this avoids.
-        add_constraint_range_filter_projection<CachedSymbol>(
-            functions_, "rva",
-            [this](const std::vector<xsql::GeneratorConstraintArg>& args, uint64_t col_used) {
-                return make_symbol_range_generator(session_, SymTagFunction, args, nullptr,
-                                                    symbol_projection_from(col_used, 2));
-            },
-            5.0, 1000.0);
-
-        auto* publics_def = &publics_;
-        add_filter_eq(publics_, "id",
-                      [publics_def, this](int64_t id) -> std::unique_ptr<xsql::RowIterator> {
-                          if (id <= 0 || id > 0xFFFFFFFFLL) {
-                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(publics_def, nullptr);
-                          }
-                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                              publics_def,
-                              std::make_unique<SymbolByIdGenerator>(session_, static_cast<DWORD>(id), SymTagPublicSymbol));
-                      },
-                      1.0, 1.0);
-        add_filter_eq_text(publics_, "name",
-                           [publics_def, this](const char* name) -> std::unique_ptr<xsql::RowIterator> {
-                               return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                                   publics_def,
-                                   std::make_unique<SymbolByNameGenerator>(session_, SymTagPublicSymbol, name ? name : ""));
-                           },
-                           5.0, 10.0);
-        add_filter_like_text(publics_, "name",
-                             [publics_def, this](const char* pattern, uint64_t col_used) -> std::unique_ptr<xsql::RowIterator> {
-                                 return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                                     publics_def,
-                                     std::make_unique<SymbolByGlobGenerator>(session_, SymTagPublicSymbol, pattern ? pattern : "",
-                                                                             symbol_projection_from(col_used, 2)));
-                             },
-                             8.0, 1000.0);
-        add_filter_eq(publics_, "rva",
-                      [publics_def, this](int64_t rva) -> std::unique_ptr<xsql::RowIterator> {
-                          if (rva < 0 || rva > 0xFFFFFFFFLL) {
-                              return std::make_unique<GeneratorRowIterator<CachedSymbol>>(publics_def, nullptr);
-                          }
-                          return std::make_unique<GeneratorRowIterator<CachedSymbol>>(
-                              publics_def,
-                              std::make_unique<SymbolByRvaGenerator>(session_, static_cast<DWORD>(rva), SymTagPublicSymbol));
-                      },
-                      1.0, 1.0);
-        // _projection: see the matching functions_.rva registration above.
-        add_constraint_range_filter_projection<CachedSymbol>(
-            publics_, "rva",
-            [this](const std::vector<xsql::GeneratorConstraintArg>& args, uint64_t col_used) {
-                return make_symbol_range_generator(session_, SymTagPublicSymbol, args, nullptr,
-                                                    symbol_projection_from(col_used, 2));
-            },
-            5.0, 1000.0);
+        add_symbol_table_filters(functions_, SymTagFunction);
+        add_symbol_table_filters(publics_, SymTagPublicSymbol);
 
         auto* data_def = &data_;
         add_filter_eq(data_, "id",
@@ -4110,16 +4134,22 @@ public:
                       },
                       5.0, 100.0);
 
-        // Bounded WHERE rva > / >= / < / <= X (and BETWEEN) -- the shape
-        // `functions f JOIN line_numbers ln ON ln.rva >= f.rva AND ln.rva <
-        // f.rva + f.length` needs. See make_line_numbers_rva_range_generator's
-        // doc comment, and observed directly against DIA.
+        // WHERE rva > / >= / < / <= X (and BETWEEN). A window bounded on both
+        // sides -- the shape `functions f JOIN line_numbers ln ON ln.rva >=
+        // f.rva AND ln.rva < f.rva + f.length` needs -- is one findLinesByRVA
+        // call, the cheapest plan here, so it also beats file_id/compiland_id
+        // next to it. A one-sided window walks every line of the PDB (see
+        // make_line_numbers_rva_range_generator's doc comment), so it is priced
+        // above the file/compiland lookups and below the full scan. On a large PDB,
+        // `file_id = X AND rva >= a AND rva < b` took 10.4 s as the
+        // file lookup (cold session) and under a second as the window.
+        auto line_numbers_window = [this](const std::vector<xsql::GeneratorConstraintArg>& args) {
+            return make_line_numbers_rva_range_generator(session_, args);
+        };
+        add_constraint_window_filter<CachedLineNumber>(
+            line_numbers_, "rva", line_numbers_window, 2.0, 50.0);
         add_constraint_range_filter<CachedLineNumber>(
-            line_numbers_, "rva",
-            [this](const std::vector<xsql::GeneratorConstraintArg>& args) {
-                return make_line_numbers_rva_range_generator(session_, args);
-            },
-            5.0, 50.0);
+            line_numbers_, "rva", line_numbers_window, 10000.0, 50000.0);
     }
 
     void register_all(xsql::Database& db) {

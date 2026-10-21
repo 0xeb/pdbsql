@@ -811,7 +811,8 @@ WHERE rva <= 50020200 AND rva > 50020100 ORDER BY rva DESC LIMIT 1;
 
 Full `addr -> symbol -> source line` costs ~175 ms warm (the `symbol_at` half
 pays its one-time ~2.7 s on the session's first call — see `symbol_at`).
-Give the range a tight lower bound like any other rva range.
+Give the range a tight lower bound: a two-sided window is a direct line lookup,
+while a one-sided one walks every line of the PDB.
 
 **Performance:** `WHERE compiland_id = <id>` and `WHERE file_id = <id>` both push
 down to a scoped DIA lookup (fast — a single compiland's or a single file's line
@@ -1151,8 +1152,8 @@ knowing them lets you pick fast queries and avoid the one slow pattern.
   after paying the full warm-up cost, not the requested budget. On a
   large PDB: a **2 s** budget on the first `file_id` query of a fresh
   session returned at **8.9 s**. (This is *not* the same as the rva-range
-  window described below — that one **is** interruptible now. The difference
-  is where the time goes: a bad rva landing spends it in a walk loop that
+  index described below — that one **is** interruptible. The difference
+  is where the time goes: the rva index is built in a walk loop that
   polls for cancellation, whereas this warm-up is a single DIA index build
   with no loop to poll.) The warm-up itself is never
   wasted, though: even a timed-out first query leaves the session's index
@@ -1207,25 +1208,24 @@ knowing them lets you pick fast queries and avoid the one slow pattern.
   *repeated* lookup of the same address is genuinely free (sub-millisecond).
   It is not, however, true O(1): each *new* address pays a real, variable
   DIA-side seek cost (typically low-single-digit ms, occasionally tens of
-  ms, depending on where that address lands — the same seek characteristic
-  that makes bounded-range queries erratic, see below). For a handful of
+  ms, depending on where that address lands). For a handful of
   addresses this is invisible; for a bulk-symbolization batch of hundreds to
   thousands of *distinct* addresses, budget roughly a few ms per new address
   rather than assuming instant (800 distinct addresses on a
   large PDB, 1.79s total, ~2.2ms/address average). `WHERE name = '<exact>'` and
   `WHERE id = <n>` push down too. **`data`/`thunks`/`labels` do NOT get the
-  bounded-range form** (`rva > / >= / < / <=`) that `functions`/`publics`
-  have — all three are a small minority of DIA's address-ordered symbol
-  stream, so an open-ended range there has to walk past every other-kind
-  symbol in between; does not finish in 30s for a 15-row sample on a
-  large PDB (confirmed for `data`; declined for `thunks`/`labels` by the
-  same reasoning rather than re-measuring an already-established trap).
+  range form** (`rva > / >= / < / <=`) that `functions`/`publics` have; an
+  rva range on them is a filtered full scan.
   `thunks`/`labels` also have no `name=` pushdown at all — see their table
   sections above.
   **Known limitation on `rva=`**: if more than one symbol genuinely shares
-  the exact same start address (real on `data` — e.g. duplicate CFG
-  guard-check entries), the pushdown returns exactly one of them, not every
-  tied row; a manual scan filtered to that rva can return more.
+  the exact same start address (folded functions on an optimized build, a
+  function and its public alias, duplicate CFG guard-check `data` entries),
+  the pushdown returns exactly one of them, not every tied row; a manual scan
+  filtered to that rva can return more. On `functions`/`publics`,
+  `WHERE rva >= X AND rva <= X` returns the whole tied set (the range form
+  below; its first use in a session builds the table's address index).
+  `rva = X` next to a range bound is still the one-symbol lookup.
   ```sql
   SELECT name FROM functions WHERE rva = 73623824;  -- pushed down, not a full-table walk
   SELECT rva  FROM functions WHERE name = 'CalcHash';
@@ -1275,60 +1275,45 @@ knowing them lets you pick fast queries and avoid the one slow pattern.
   `Prefix`, not `PrefixAllocator` or `Prefix::Nested::<lambda_1>` — so use
   it when you genuinely know the type name, and accept the walk (or the
   bulk-export/cache route below) when you truly need the prefix set.
-- **`WHERE rva > / >= / < / <= <addr>` on `functions`/`publics` is a BOUNDED range**
-  lookup (one address-index seek + a forward walk that stops at the upper bound) — use
-  it for "what's in this address window", not as a substitute for `LIMIT`/`OFFSET`
-  paging of the whole table. For a full-table pull, use a plain unbounded `SELECT`
-  with `X-XSQL-Stream` (HTTP) or `--dump`/`--format jsonl` (CLI) instead.
+- **`WHERE rva > / >= / < / <= <addr>` on `functions`/`publics` is an exact, rva-ordered range**
+  — every row a full scan has in that window, already sorted by `rva` — use it for
+  "what's in this address window", not as a substitute for `LIMIT`/`OFFSET` paging
+  of the whole table. For a full-table pull, use a plain unbounded `SELECT` with
+  `X-XSQL-Stream` (HTTP) or `--dump`/`--format jsonl` (CLI) instead.
   ```sql
   SELECT name, rva FROM functions WHERE rva > 0x140010000 AND rva < 0x140020000;
   ```
-  **ALWAYS give the range a tight UPPER bound — omitting it costs ~5,500x for
-  the identical rows.** "Stops at the upper bound" is the whole mechanism: with
-  no upper bound the walk drains the entire address space, and the address
-  enumerator yields **every symbol kind** (not just the one you asked for),
-  each discarded one at a time. all three returning
-  the **same 925 rows**:
+  **It includes every symbol that shares an address.** On an optimized build many
+  functions are folded onto one address (identical COMDAT folding), a function and
+  its public alias share their start, and some CFG data symbols share a function's
+  start. All of them are returned. `WHERE rva = X` returns only ONE of a tied set
+  (see above); `WHERE rva >= X AND rva <= X` returns all of them.
 
-  | query | cost |
-  |---|---|
-  | `WHERE rva > 186241964` | **121,128 ms** |
-  | `WHERE rva > 186241964 AND rva < 4294967295` | **> 60 s (timeout)** |
-  | `WHERE rva > 186241964 AND rva < 186441965` | **22 ms** |
+  **Cost: one walk of the table's addresses per session, then a lookup.** DIA has
+  no address index that lists every symbol at an address, so the first range
+  query on `functions` (or `publics`) in a session walks that table once, reading
+  only each symbol's address, and keeps the sorted result for the rest of the
+  session. That first query costs seconds on a large PDB (`functions` is the
+  slower of the two), wherever its window lands. Every later range query on the
+  same table, any window, costs a binary search plus its own rows: milliseconds
+  for a window of a few thousand symbols. So:
+  - Expect the first range query of a session to be slow and the rest fast. On a
+    server, one `functions`/`publics` range query sent right after startup pays it
+    for every client.
+  - `LIMIT` stops early, and both `ORDER BY rva` and `ORDER BY rva DESC` are
+    served in order without a sort: `WHERE rva > 0 ORDER BY rva DESC LIMIT 1`
+    is the highest address. A very wide window that returns most of the table
+    costs about what a full scan does (every returned row is read in full).
+  - For a single exact start address, `WHERE rva = X` needs no index (one
+    symbol, milliseconds); use `WHERE rva >= X AND rva <= X` for the whole tied
+    set.
+  - `WHERE name = 'x'`, `WHERE id = n` or `WHERE name LIKE 'prefix%'`
+    combined with an rva range is planned as the name, id or `LIKE` lookup,
+    and the range is then applied to its rows; it builds no address index.
 
-  Note the middle row: an upper bound placed *past the last symbol* is no
-  better than none, because the walk still runs to the end. Padding to
-  `0xFFFFFFFF` does not help — the bound must actually cut the walk short. If
-  the question really is "everything after X", take the ceiling from
-  `SELECT MAX(rva) FROM functions` (~16 s once on a large PDB) and use
-  `max + 1`, rather than leaving the range open.
-
-  This is also why **`ORDER BY rva DESC` does not complete** on a large PDB
-  while ascending `ORDER BY rva` costs 21 ms: only the ascending direction is
-  claimed by the index, so `DESC` forces a full materialize. For "the N
-  highest addresses", select a tail window with a tight two-sided range and
-  reverse the rows client-side.
-  **Cost is driven by WHERE the window lands, not how wide it is or how many rows
-  it returns.** The seek is not O(1): most windows resolve in single-digit
-  milliseconds regardless of size, but a window landing in an unlucky address
-  region can take 10+ seconds even for a modest window with a normal row count
-  (a 0x10000-byte window with an ordinary row count took ~14s in one region,
-  vs ~8ms for a similar-sized/row-count window elsewhere) — and it does NOT warm
-  up on repeat, unlike a flat `rva=` lookup. A sweep of eleven 200 KB windows
-  across a large PDB found ten at 0-43 ms and one at **7.6 s**; zooming in
-  located a ~2 MB band where it peaks at **28.3 s**. Note what the worst window
-  returned: **zero rows**. Cost here is *anti*-correlated with result size —
-  the 28.3 s window found nothing, while a neighbouring window returned 1,295
-  rows in 43 ms. Do not infer that a slow range query is "returning a lot". **The effect is size-dependent**: that
-  ~14s worst case was on a large PDB, while the same sweep across a much
-  smaller one found *no* cliff at all. Expect it on multi-GB PDBs; don't design
-  around it on small ones. **`X-XSQL-Timeout` DOES bound this** (it did not used to): the cost turns out
-  to be in the walk, not in the seek, and that loop now polls for cancellation,
-  so a bad landing is interruptible at a bounded overshoot. Against the
-  28.3 s window above: a 1 s budget returned at 1.43 s, 5 s at 5.23 s, 10 s at
-  10.01 s, each reporting `timed_out`. `POST /cancel` is accepted too. **A
-  stalled range query no longer requires restarting the server** — bound it and
-  retry elsewhere.
+  The first query's walk polls the query timeout, so `X-XSQL-Timeout` and
+  `POST /cancel` stop it at a bounded overshoot. A stopped walk returns no rows
+  and keeps nothing: the next range query on that table walks it again.
 - **`symbol_at(<addr>)` resolves an address INSIDE a symbol → the containing symbol**
   (of any kind), also via findSymbolByRVA — the true symbolization primitive,
   with the same per-new-address seek cost as flat `rva=` above (not literal
@@ -1969,7 +1954,7 @@ pdbsql database.pdb --mcp
 curl http://localhost:8080/help
 
 # Execute SQL query
-curl -X POST http://localhost:8080/query -d "SELECT name, rva FROM functions LIMIT 5"
+curl -X POST http://localhost:8080/query --data-binary "SELECT name, rva FROM functions LIMIT 5"
 
 # With authentication
 curl -X POST http://localhost:8080/query \

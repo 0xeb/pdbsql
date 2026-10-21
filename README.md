@@ -119,18 +119,18 @@ pdbsql> .quit
 pdbsql test.pdb --http 8080 --token secret123
 
 # Terminal 2: Query over HTTP
-curl -X POST http://localhost:8080/query -H "Authorization: Bearer secret123" -d "SELECT * FROM sections"
+curl -X POST http://localhost:8080/query -H "Authorization: Bearer secret123" --data-binary "SELECT * FROM sections"
 
 # Stream a large result row-by-row: first byte in milliseconds and flat server
 # memory, instead of waiting for the whole query and buffering it. Total time can
 # be slightly higher than buffered. Use curl -N or the client will buffer anyway.
-curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: 1" -d "SELECT name FROM publics"
+curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: 1" --data-binary "SELECT name FROM publics"
 
 # Bound a single request (ms; 0 = no limit), independent of the server default
-curl -X POST http://localhost:8080/query -H "X-XSQL-Timeout: 5000" -d "SELECT name,rva FROM functions"
+curl -X POST http://localhost:8080/query -H "X-XSQL-Timeout: 5000" --data-binary "SELECT name,rva FROM functions"
 
 # NDJSON stream: one JSON object per row per line (append rows to a file as they arrive)
-curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: ndjson" -d "SELECT name,rva FROM functions"
+curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: ndjson" --data-binary "SELECT name,rva FROM functions"
 ```
 
 > **Queries are serialized — one slow query blocks every other client.** The DIA
@@ -151,7 +151,7 @@ curl -N -X POST http://localhost:8080/query -H "X-XSQL-Stream: ndjson" -d "SELEC
 > reports the failure *inside* an HTTP 200).
 >
 > ```bash
-> curl -N -X POST http://localhost:8080/query -H "Content-Type: text/plain" -d \
+> curl -N -X POST http://localhost:8080/query -H "Content-Type: text/plain" --data-binary \
 >   "WITH addrs(a) AS (SELECT value FROM json_each('[4198400,4198512]'))
 >    SELECT a, (SELECT name FROM symbol_at(a)) FROM addrs"
 > ```
@@ -190,18 +190,21 @@ Valid `--warm-tables` names: `functions`, `publics`, `data`, `udts`,
 > the index built), so raise the bound for the first query rather than
 > retrying it hoping for a cheaper outcome — or pre-warm at startup as above.
 
-**Bounded address-range queries** (`WHERE rva > X AND rva < Y` on
-`functions`/`publics`) are index-backed but not O(1): cost depends on *where* the
-window lands, not its width — the same width can cost milliseconds in one region
-and seconds in another, and it does not warm up on repeat. Use them for a known
-address window, not as a general-purpose scan.
+**Address-range queries** (`WHERE rva > X AND rva < Y` on `functions`/`publics`)
+return every symbol in the window, including all of the symbols that share one
+address (folded functions, public aliases), in `rva` order (`ORDER BY rva DESC` too).
+The first one on a table in a session walks that table's addresses once and keeps
+them sorted, which takes seconds on a large PDB; every later range query on the same
+table is a lookup plus its own rows. `WHERE rva = X` stays a millisecond lookup of
+one symbol. A range next to `name = 'x'`, `id = n` or `name LIKE 'prefix%'` runs
+that lookup and filters its rows by address instead.
 
 ```bash
 # Cancel the in-flight query from another connection (it returns its partial rows)
 curl -X POST http://localhost:8080/cancel -H "Authorization: Bearer secret123"
 
 # Change the per-query timeout at runtime (default 60000 ms; 0 = no limit)
-curl -X POST http://localhost:8080/query -d "UPDATE runtime_settings SET value='30000' WHERE key='query_timeout_ms'"
+curl -X POST http://localhost:8080/query --data-binary "UPDATE runtime_settings SET value='30000' WHERE key='query_timeout_ms'"
 
 # ...or seed it at startup (--query-timeout 0 disables the cap for a known-big dump)
 pdbsql test.pdb --http 8080 --query-timeout 30

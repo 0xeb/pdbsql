@@ -7,7 +7,7 @@
 #
 
 cmake_minimum_required(VERSION 3.20)
-project(pdbsql VERSION 0.0.7 LANGUAGES C CXX)
+project(pdbsql VERSION 0.0.8 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -134,7 +134,7 @@ else()
     include(FetchContent)
     FetchContent_Declare(libxsql
         GIT_REPOSITORY https://github.com/0xeb/libxsql.git
-        GIT_TAG        main
+        GIT_TAG        v1.0.25
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(libxsql)

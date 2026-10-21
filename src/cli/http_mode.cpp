@@ -173,7 +173,7 @@ int run_http_mode(const std::string& pdb_path, int port, const std::string& bind
     }
 
     printf("HTTP server listening on http://%s:%d\n",
-           bind_addr.empty() ? "127.0.0.1" : bind_addr.c_str(), actual_port);
+           xsql::thinclient::format_url_host(bind_addr).c_str(), actual_port);
     printf("Endpoints: /help, /query, /cancel, /status, /shutdown\n");
     printf("Example: curl http://localhost:%d/help\n", actual_port);
     printf("Press Ctrl+C to stop.\n\n");

@@ -224,7 +224,7 @@ inline CommandResult handle_command(
                      "  POST /shutdown   Stop server\n"
                      "\n"
                      "Example:\n"
-                     "  curl -X POST http://127.0.0.1:<port>/query -d \"SELECT name FROM functions LIMIT 5\"\n";
+                     "  curl -X POST http://127.0.0.1:<port>/query --data-binary \"SELECT name FROM functions LIMIT 5\"\n";
         }
         else {
             output = "Unknown HTTP command: " + subargs + "\nUse '.http help' for available commands.";

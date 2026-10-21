@@ -130,13 +130,10 @@ private:
 };
 
 /**
- * Format MCP server info for display
+ * Format MCP server info for display: the SSE endpoint of a server bound to
+ * `bind_addr`, and a client config that dials it (a wildcard bind through its
+ * loopback).
  */
-std::string format_mcp_info(int port);
-
-/**
- * Format MCP server status
- */
-std::string format_mcp_status(int port, bool running);
+std::string format_mcp_info(int port, const std::string& bind_addr);
 
 } // namespace pdbsql
